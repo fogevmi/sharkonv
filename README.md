@@ -10,6 +10,8 @@
 
 **Скачать:** [последний релиз](https://github.com/fogevmi/sharkonv/releases/latest) — `sharkonv-<версия>.zip`.
 
+<p align="center"><img src="docs/screenshot.png" width="600" alt="Окно Sharkonv: список книг и выбор формата"></p>
+
 Поддерживаемые направления (все со всеми):
 
 | Вход | Выход |
