@@ -1905,7 +1905,7 @@ struct Gutter {
     double a, b;
 };
 
-FILE* layoutLog = NULL; /* FB2CONV_PDFDEBUG: разбор вёрстки по страницам */
+FILE* layoutLog = NULL; /* SHARKONV_PDFDEBUG: разбор вёрстки по страницам */
 
 /* строка пересекает межколонник, только если перекрывает его целиком (заголовок на всю ширину);
    строка с неровным правым краем может заходить в полосу, но до другой колонки не доходит */
@@ -2433,7 +2433,7 @@ bool PdfBook::read(std::string* err) {
     }
 
     /* текст всех страниц */
-    const char* dbgEnv = getenv("FB2CONV_PDFDEBUG");
+    const char* dbgEnv = getenv("SHARKONV_PDFDEBUG");
     if (dbgEnv && *dbgEnv) layoutLog = fopen((std::string(dbgEnv) + ".layout").c_str(), "wb");
     struct LogCloser {
         ~LogCloser() { if (layoutLog) { fclose(layoutLog); layoutLog = NULL; } }
@@ -2532,8 +2532,8 @@ bool PdfBook::read(std::string* err) {
             if (lines[i].kind == 1 && imgPages[lines[i].img].size() >= 3 && imgPages[lines[i].img].size() * 2 >= pages.size())
                 lines[i].drop = true;
     }
-    /* FB2CONV_PDFDEBUG=файл — строки страниц, как их увидел разбор (для разбора жалоб) */
-    const char* dbg = getenv("FB2CONV_PDFDEBUG");
+    /* SHARKONV_PDFDEBUG=файл — строки страниц, как их увидел разбор (для разбора жалоб) */
+    const char* dbg = getenv("SHARKONV_PDFDEBUG");
     if (dbg && *dbg) {
         FILE* f = fopen(dbg, "wb");
         if (f) {

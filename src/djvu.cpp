@@ -644,8 +644,8 @@ bool DjvuReader::read(const std::string& f, std::string* err) {
         return false;
     }
 
-    /* FB2CONV_DJVUDEBUG=файл — сырой текстовый слой каждой страницы, страницы через \f */
-    const char* dbg = getenv("FB2CONV_DJVUDEBUG");
+    /* SHARKONV_DJVUDEBUG=файл — сырой текстовый слой каждой страницы, страницы через \f */
+    const char* dbg = getenv("SHARKONV_DJVUDEBUG");
     if (dbg && *dbg) {
         FILE* df = fopen(dbg, "wb");
         if (df) {
@@ -805,7 +805,7 @@ bool DjvuReader::read(const std::string& f, std::string* err) {
             if (!h.empty()) ch.back().blocks.push_back(Block::p(h));
         }
     };
-    /* FB2CONV_DJVUDEBUG: рядом с сырым текстом — раскладка строк (<файл>.layout) */
+    /* SHARKONV_DJVUDEBUG: рядом с сырым текстом — раскладка строк (<файл>.layout) */
     FILE* lf = NULL;
     if (dbg && *dbg) lf = fopen((std::string(dbg) + ".layout").c_str(), "wb");
     if (lf) fprintf(lf, "lh=%.1f\n", lh);

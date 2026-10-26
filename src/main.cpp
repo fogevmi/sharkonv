@@ -4,7 +4,7 @@
 
 int runGui(HINSTANCE hInst, const std::vector<std::wstring>& files);
 
-#define APP_VERSION L"1.6"
+#define APP_VERSION L"1.7"
 
 /* --------------------------- вывод в консоль ---------------------------- */
 
@@ -40,7 +40,7 @@ static bool openConsoleOutput() {
     }
     if (!AttachConsole(ATTACH_PARENT_PROCESS)) {
         if (!AllocConsole()) return false;
-        SetConsoleTitleW(L"FB2 Конвертер");
+        SetConsoleTitleW(L"Sharkonv");
         g_ownConsole = true;
     }
     g_out = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -135,12 +135,12 @@ bool convertOne(const std::wstring& inPath, const std::string& target, const std
 /* -------------------------------- CLI ----------------------------------- */
 
 static void printHelp() {
-    conLine(L"FB2 Конвертер " APP_VERSION L" — конвертация книг без браузера и установки.");
+    conLine(L"Sharkonv " APP_VERSION L" — конвертация книг без браузера и установки.");
     conLine(L"");
     conLine(L"Без ключей открывается окно. С ключами — консольный режим:");
-    conLine(L"  fb2conv.exe -f epub книга.fb2          -> EPUB рядом с исходным файлом");
-    conLine(L"  fb2conv.exe -f fb2 D:\\Книги            вся папка (вложенные тоже) -> FB2");
-    conLine(L"  fb2conv.exe -f auto -o D:\\Out D:\\In    авто: FB2 -> EPUB, остальное -> FB2");
+    conLine(L"  sharkonv.exe -f epub книга.fb2         -> EPUB рядом с исходным файлом");
+    conLine(L"  sharkonv.exe -f fb2 D:\\Книги           вся папка (вложенные тоже) -> FB2");
+    conLine(L"  sharkonv.exe -f auto -o D:\\Out D:\\In   авто: FB2 -> EPUB, остальное -> FB2");
     conLine(L"");
     conLine(L"Ключи:");
     conLine(L"  -f, --format  auto | fb2 | epub | html | txt | mobi");
@@ -151,7 +151,7 @@ static void printHelp() {
     conLine(L"В консольном режиме существующий файл результата заменяется.");
     conLine(L"Код возврата: 0 — без ошибок, 1 — были ошибки, 2 — неверные параметры.");
     conLine(L"В .bat-файле программа дожидается конца сама; в окне cmd используйте");
-    conLine(L"  start /wait fb2conv.exe -f epub книга.fb2");
+    conLine(L"  start /wait sharkonv.exe -f epub книга.fb2");
 }
 
 static int runCliBody(const std::vector<std::wstring>& args) {
@@ -175,7 +175,7 @@ static int runCliBody(const std::vector<std::wstring>& args) {
             return 0;
         }
         if (_wcsicmp(a.c_str(), L"-v") == 0 || _wcsicmp(a.c_str(), L"--version") == 0) {
-            conLine(L"FB2 Конвертер " APP_VERSION);
+            conLine(L"Sharkonv " APP_VERSION);
             return 0;
         }
         if (!a.empty() && (a[0] == L'-' || a[0] == L'/')) {

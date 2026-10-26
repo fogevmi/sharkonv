@@ -119,7 +119,7 @@ void initDpi() {
 
 /* ------------------------- настройки (рядом с exe) ------------------------ */
 
-/* Портативно: fb2conv.ini лежит рядом с программой, реестр не используется.
+/* Портативно: sharkonv.ini лежит рядом с программой, реестр не используется.
    Если папка только для чтения — настройка просто не сохранится. */
 std::wstring iniPath() {
     wchar_t buf[MAX_PATH * 2];
@@ -127,7 +127,14 @@ std::wstring iniPath() {
     if (!n || n >= MAX_PATH * 2) return std::wstring();
     std::wstring p(buf, n);
     size_t sl = p.find_last_of(L"\\/");
-    return (sl == std::wstring::npos ? std::wstring() : p.substr(0, sl + 1)) + L"fb2conv.ini";
+    std::wstring dir = sl == std::wstring::npos ? std::wstring() : p.substr(0, sl + 1);
+    std::wstring ini = dir + L"sharkonv.ini";
+    /* до 1.7 программа звалась FB2 Конвертер, а настройки — fb2conv.ini: забираем их себе */
+    std::wstring old = dir + L"fb2conv.ini";
+    if (GetFileAttributesW(ini.c_str()) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(old.c_str()) != INVALID_FILE_ATTRIBUTES)
+        MoveFileW(old.c_str(), ini.c_str());
+    return ini;
 }
 
 std::wstring iniGet(const wchar_t* key) {
@@ -298,7 +305,7 @@ void showPlanned(int i) {
 }
 
 void refreshTitle() {
-    std::wstring t = L"FB2 Конвертер";
+    std::wstring t = L"Sharkonv";
     if (!g_app.files.empty()) t += L" — " + books((int)g_app.files.size());
     SetWindowTextW(g_app.hwnd, t.c_str());
 }
@@ -540,7 +547,7 @@ void chooseFiles() {
     ofn.lpstrFile = buf;
     ofn.nMaxFile = 32768;
     ofn.lpstrTitle = L"Выберите книги (можно несколько)";
-    /* последняя папка — из fb2conv.ini, а не из истории Windows */
+    /* последняя папка — из sharkonv.ini, а не из истории Windows */
     std::wstring startDir = iniGet(L"folder");
     if (!startDir.empty() && dirExistsW(startDir)) ofn.lpstrInitialDir = startDir.c_str();
     ofn.Flags = OFN_ALLOWMULTISELECT | OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY |
@@ -1048,7 +1055,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CLOSE:
             if (g_app.busy) {
                 if (MessageBoxW(hwnd, L"Идёт конвертация. Дождаться окончания и закрыть?",
-                                L"FB2 Конвертер", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1) != IDYES)
+                                L"Sharkonv", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON1) != IDYES)
                     return 0;
                 /* даём текущему файлу дописаться, не замораживая окно */
                 DWORD start = GetTickCount();
@@ -1090,7 +1097,7 @@ int runGui(HINSTANCE hInst, const std::vector<std::wstring>& files) {
     dc.lpszClassName = L"FB2DropZone";
     RegisterClassExW(&dc);
 
-    const wchar_t* kClass = L"FB2ConverterWindow";
+    const wchar_t* kClass = L"SharkonvWindow";
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
@@ -1115,7 +1122,7 @@ int runGui(HINSTANCE hInst, const std::vector<std::wstring>& files) {
     if (h > sh - 80) h = sh - 80;
     int x = (sw - w) / 2, y = (sh - h) / 2;
 
-    /* прошлое положение окна из fb2conv.ini — если оно целиком на рабочем столе */
+    /* прошлое положение окна из sharkonv.ini — если оно целиком на рабочем столе */
     int ix = iniGetInt(L"x", -32000), iy = iniGetInt(L"y", -32000);
     int iw = iniGetInt(L"w", 0), ih = iniGetInt(L"h", 0);
     RECT desk = {GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
@@ -1126,7 +1133,7 @@ int runGui(HINSTANCE hInst, const std::vector<std::wstring>& files) {
         x = ix; y = iy; w = iw; h = ih;
     }
 
-    HWND hwnd = CreateWindowExW(0, kClass, L"FB2 Конвертер",
+    HWND hwnd = CreateWindowExW(0, kClass, L"Sharkonv",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 x, y, w, h, NULL, NULL, hInst, NULL);
     if (!hwnd) return 1;

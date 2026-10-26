@@ -1,81 +1,24 @@
-# Генерация app.ico (BMP-формат, совместим с Windows XP).
-# Рисуем «книгу» на синем фоне.
+# Сборка src\app.ico из готовых картинок docs\icon\<размер>.png (логотип Sharkonv — акула,
+# уменьшенная из docs\logo.webp). 16…128 пишутся 32-битным BMP — его понимает Windows XP;
+# 256 — PNG внутри ICO (Vista и новее показывают его в проводнике, XP эту запись пропускает).
 Add-Type -AssemblyName System.Drawing
 
-$out = Join-Path $PSScriptRoot '..\src\app.ico'
-$out = [IO.Path]::GetFullPath($out)
-$sizes = @(16, 24, 32, 48, 64, 128)
-
-function New-RoundedPath([single]$x, [single]$y, [single]$w, [single]$h, [single]$r) {
-    $p = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $d = $r * 2
-    $p.AddArc($x, $y, $d, $d, 180, 90)
-    $p.AddArc($x + $w - $d, $y, $d, $d, 270, 90)
-    $p.AddArc($x + $w - $d, $y + $h - $d, $d, $d, 0, 90)
-    $p.AddArc($x, $y + $h - $d, $d, $d, 90, 90)
-    $p.CloseFigure()
-    return $p
-}
+$root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$out = "$root\src\app.ico"
+$sizes = @(16, 24, 32, 48, 64, 128, 256)
 
 $images = @()
 foreach ($s in $sizes) {
+    $png = "$root\docs\icon\$s.png"
+    if ($s -ge 256) {
+        $images += ,@($s, [IO.File]::ReadAllBytes($png))
+        continue
+    }
+    $src = [System.Drawing.Image]::FromFile($png)
     $bmp = New-Object System.Drawing.Bitmap($s, $s, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-    $g.Clear([System.Drawing.Color]::Transparent)
-
-    # фон — скруглённый квадрат с градиентом
-    $bgPath = New-RoundedPath 0 0 $s $s ($s * 0.20)
-    $rect = New-Object System.Drawing.RectangleF(0, 0, $s, $s)
-    $c1 = [System.Drawing.Color]::FromArgb(255, 62, 124, 232)
-    $c2 = [System.Drawing.Color]::FromArgb(255, 22, 62, 158)
-    $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush($rect, $c1, $c2, 45.0)
-    $g.FillPath($brush, $bgPath)
-    $brush.Dispose()
-
-    # книга
-    $bx = $s * 0.20; $by = $s * 0.18; $bw = $s * 0.60; $bh = $s * 0.64
-    $pagePath = New-RoundedPath $bx $by $bw $bh ($s * 0.05)
-    $white = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
-    $g.FillPath($white, $pagePath)
-
-    # корешок
-    $spine = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 200, 216, 245))
-    $g.FillRectangle($spine, [single]($bx + $s * 0.02), [single]($by + $s * 0.03),
-                     [single]($s * 0.09), [single]($bh - $s * 0.06))
-
-    if ($s -ge 32) {
-        # надпись FB2
-        $fs = [single]($s * 0.20)
-        $font = New-Object System.Drawing.Font('Arial', $fs, [System.Drawing.FontStyle]::Bold, [System.Drawing.GraphicsUnit]::Pixel)
-        $blue = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 26, 74, 170))
-        $sf = New-Object System.Drawing.StringFormat
-        $sf.Alignment = [System.Drawing.StringAlignment]::Center
-        $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-        $tr = New-Object System.Drawing.RectangleF(($bx + $s * 0.10), $by, ($bw - $s * 0.12), $bh)
-        $g.DrawString('FB2', $font, $blue, $tr, $sf)
-        $sf.Dispose(); $font.Dispose(); $blue.Dispose()
-    } else {
-        # мелкий размер — три строки вместо текста
-        $line = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 40, 90, 190))
-        for ($i = 0; $i -lt 3; $i++) {
-            $ly = $by + $s * (0.26 + $i * 0.17)
-            $g.FillRectangle($line, [single]($bx + $s * 0.17), [single]$ly,
-                             [single]($s * (0.34 - $i * 0.05)), [single][Math]::Max(1, $s * 0.06))
-        }
-        $line.Dispose()
-    }
-
-    # лёгкая тень-обводка книги
-    $pen = New-Object System.Drawing.Pen -ArgumentList @(
-        [System.Drawing.Color]::FromArgb(60, 10, 30, 80),
-        [single][Math]::Max(1, $s * 0.02))
-    $g.DrawPath($pen, $pagePath)
-    $pen.Dispose()
-
-    $white.Dispose(); $spine.Dispose(); $pagePath.Dispose(); $bgPath.Dispose()
-    $g.Dispose()
+    $g.DrawImage($src, 0, 0, $s, $s)
+    $g.Dispose(); $src.Dispose()
 
     # пиксели BGRA снизу вверх
     $data = $bmp.LockBits((New-Object System.Drawing.Rectangle(0, 0, $s, $s)),
@@ -91,8 +34,16 @@ foreach ($s in $sizes) {
         $off = $y * $stride
         for ($k = 0; $k -lt $s * 4; $k++) { $xor.Add($bytes[$off + $k]) }
     }
+    # маска AND: 1 — прозрачный пиксель (для XP без альфа-канала, например в 256 цветах)
     $andStride = [int]([Math]::Ceiling($s / 32.0) * 4)
     $andMask = New-Object byte[] ($andStride * $s)
+    for ($y = 0; $y -lt $s; $y++) {
+        for ($x = 0; $x -lt $s; $x++) {
+            if ($bytes[($s - 1 - $y) * $stride + $x * 4 + 3] -lt 128) {
+                $andMask[$y * $andStride + [int][Math]::Floor($x / 8)] = $andMask[$y * $andStride + [int][Math]::Floor($x / 8)] -bor (0x80 -shr ($x % 8))
+            }
+        }
+    }
 
     $ms = New-Object System.IO.MemoryStream
     $bw2 = New-Object System.IO.BinaryWriter($ms)

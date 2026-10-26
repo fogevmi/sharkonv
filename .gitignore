@@ -2,4 +2,5 @@
 build/
 dist/
 *.zip
+sharkonv.ini
 fb2conv.ini

@@ -56,7 +56,7 @@ struct Meta {
     std::string seriesNum;
     std::vector<Author> translators;
     std::string program;
-    Meta() : lang("ru"), program("FB2 Конвертер") {}
+    Meta() : lang("ru"), program("Sharkonv") {}
 };
 
 struct Image {

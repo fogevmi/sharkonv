@@ -6,8 +6,8 @@ param([string[]]$TestData = @("$PSScriptRoot\..\tests", "$PSScriptRoot\..\..\fb2
 $ErrorActionPreference = 'Stop'
 $root = Resolve-Path "$PSScriptRoot\.."
 # one exe for everything: with switches it runs in console mode
-$cli = "$root\build\fb2conv.exe"
-$work = Join-Path $env:TEMP "fb2conv-test"
+$cli = "$root\build\sharkonv.exe"
+$work = Join-Path $env:TEMP "sharkonv-test"
 if (Test-Path $work) { Remove-Item $work -Recurse -Force }
 New-Item -ItemType Directory $work | Out-Null
 
@@ -294,9 +294,9 @@ function DjvuNorm([string]$s) { ((($s -replace [string][char]0xFFFD, '') -replac
 foreach ($ref in Get-ChildItem $corpus -Filter *.reftext.json -ErrorAction SilentlyContinue) {
     $name = $ref.Name -replace '\.reftext\.json$', ''
     $raw = Join-Path $work "$name.djvu.raw"
-    $env:FB2CONV_DJVUDEBUG = $raw
+    $env:SHARKONV_DJVUDEBUG = $raw
     $null = & $cli -f fb2 -o (Join-Path $work 'djvu-raw') (Join-Path $corpus "$name.djvu") | Out-String
-    $env:FB2CONV_DJVUDEBUG = ''
+    $env:SHARKONV_DJVUDEBUG = ''
     if (-not (Test-Path $raw)) { $fail++; Write-Host "FAIL  DjVu text layer ${name}: nothing decoded" -ForegroundColor Red; continue }
     # ConvertFrom-Json passes a JSON array down the pipeline as one object: assign it first
     $want = [IO.File]::ReadAllText($ref.FullName, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -319,7 +319,7 @@ if (Test-Path $nt) {
 $ver = (& $cli -v | Out-String).Trim()
 $null = & $cli -f nosuch "$work\x.fb2" | Out-String; $badFmt = $LASTEXITCODE
 $help = & $cli -h | Out-String
-if ($ver -match '^FB2 .+ \d+\.\d+$' -and $badFmt -eq 2 -and $help -match 'start /wait') {
+if ($ver -match '^Sharkonv \d+\.\d+$' -and $badFmt -eq 2 -and $help -match 'start /wait') {
     $pass++; Write-Host "OK    console mode: '$ver', bad format -> exit 2, help printed"
 } else {
     $fail++; Write-Host "FAIL  console mode: ver='$ver' badFmt=$badFmt help=$($help.Length) chars" -ForegroundColor Red
@@ -340,7 +340,7 @@ Write-Host $ntOut.Trim()
 if ($LASTEXITCODE -eq 0) { $pass++; Write-Host "OK    no registry traces from the open dialog" }
 else { $fail++; Write-Host "FAIL  registry traces:`n$ntOut" -ForegroundColor Red }
 
-foreach ($exe in "$root\build\fb2conv.exe") {
+foreach ($exe in "$root\build\sharkonv.exe") {
     $imports = & $objdump -p $exe | Select-String '^\s+[0-9a-f]+\s+\d+\s+(\w+)' |
                ForEach-Object { $_.Matches[0].Groups[1].Value }
     $bad = $imports | Where-Object { $_ -match "^($notOnXp)" }

@@ -1,4 +1,4 @@
-/* FB2 Конвертер — общие объявления.
+/* Sharkonv — общие объявления.
    Нативный Win32, совместимость с Windows XP SP3 .. Windows 11. */
 #ifndef FB2C_COMMON_H
 #define FB2C_COMMON_H

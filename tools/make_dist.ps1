@@ -1,6 +1,6 @@
 # Packs the built program into dist\ and two archives:
-#   dist\fb2conv-<ver>.zip      - what users download (one exe + README.txt)
-#   fb2-converter-cpp-src.zip   - sources that build with one build.bat call
+#   dist\sharkonv-<ver>.zip      - what users download (one exe + README.txt)
+#   sharkonv-src.zip   - sources that build with one build.bat call
 # Run build.bat and tools\test.ps1 first.
 $ErrorActionPreference = 'Stop'
 $root = (Resolve-Path "$PSScriptRoot\..").Path
@@ -20,28 +20,28 @@ function Zip([string]$zipPath, [hashtable]$files) {
 $dist = "$root\dist"
 New-Item -ItemType Directory -Force $dist | Out-Null
 # the exe may be running from dist\ (locked): replace it only when the build differs
-Get-ChildItem $dist | Where-Object { $_.Name -ne 'fb2conv.exe' } | Remove-Item -Recurse -Force
-$old = "$dist\fb2conv.exe"
-if (-not (Test-Path $old) -or (Get-FileHash $old).Hash -ne (Get-FileHash "$root\build\fb2conv.exe").Hash) {
-    Copy-Item "$root\build\fb2conv.exe" $dist -Force
+Get-ChildItem $dist | Where-Object { $_.Name -ne 'sharkonv.exe' } | Remove-Item -Recurse -Force
+$old = "$dist\sharkonv.exe"
+if (-not (Test-Path $old) -or (Get-FileHash $old).Hash -ne (Get-FileHash "$root\build\sharkonv.exe").Hash) {
+    Copy-Item "$root\build\sharkonv.exe" $dist -Force
 }
 $readme = [IO.File]::ReadAllText("$root\dist-readme.txt") -replace "`r?`n", "`r`n"
 [IO.File]::WriteAllText("$dist\README.txt", $readme, (New-Object Text.UTF8Encoding $true))
 
-$userZip = "$dist\fb2conv-$ver.zip"
+$userZip = "$dist\sharkonv-$ver.zip"
 Zip $userZip @{
-    'fb2conv/fb2conv.exe' = "$dist\fb2conv.exe"
-    'fb2conv/README.txt'  = "$dist\README.txt"
+    'sharkonv/sharkonv.exe' = "$dist\sharkonv.exe"
+    'sharkonv/README.txt'  = "$dist\README.txt"
 }
 
 $src = @{}
 foreach ($f in Get-ChildItem "$root\src", "$root\tools", "$root\tests" -File -Recurse) {
     $rel = $f.FullName.Substring($root.Length + 1).Replace('\', '/')
-    $src["fb2-converter-cpp/" + $rel] = $f.FullName
+    $src["sharkonv/" + $rel] = $f.FullName
 }
-foreach ($n in 'build.bat', 'README.md', 'dist-readme.txt') { $src["fb2-converter-cpp/$n"] = "$root\$n" }
-Zip "$root\fb2-converter-cpp-src.zip" $src
+foreach ($n in 'build.bat', 'README.md', 'dist-readme.txt') { $src["sharkonv/$n"] = "$root\$n" }
+Zip "$root\sharkonv-src.zip" $src
 
-Get-ChildItem $dist, "$root\fb2-converter-cpp-src.zip" -File |
+Get-ChildItem $dist, "$root\sharkonv-src.zip" -File |
     Select-Object Name, Length, @{n = 'SHA1'; e = { (Get-FileHash $_.FullName -Algorithm SHA1).Hash.Substring(0, 12) } } |
     Format-Table -AutoSize
