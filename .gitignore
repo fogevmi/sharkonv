@@ -1,0 +1,5 @@
+# сборка и раздача — в релизах GitHub, не в коде
+build/
+dist/
+*.zip
+fb2conv.ini
