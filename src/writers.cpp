@@ -1200,23 +1200,38 @@ static void mobiBlocks(const std::vector<Block>& blocks, MobCtx& c, std::string&
     }
 }
 
+/* PalmDB и MOBI — big-endian (старший байт первым), как на Palm и в Kindle.
+   1.8: до этой версии здесь был little-endian — такой MOBI не открывали ни Kindle, ни Calibre,
+   а тесты не замечали, потому что читатель ошибался зеркально. */
 static void mobiPut32(Bytes& b, unsigned v) {
-    b.push_back((unsigned char)(v & 0xFF));
-    b.push_back((unsigned char)((v >> 8) & 0xFF));
-    b.push_back((unsigned char)((v >> 16) & 0xFF));
     b.push_back((unsigned char)((v >> 24) & 0xFF));
+    b.push_back((unsigned char)((v >> 16) & 0xFF));
+    b.push_back((unsigned char)((v >> 8) & 0xFF));
+    b.push_back((unsigned char)(v & 0xFF));
 }
 static void mobiSet16(Bytes& b, size_t p, unsigned v) {
     if (p + 2 > b.size()) return;
-    b[p] = (unsigned char)(v & 0xFF);
-    b[p + 1] = (unsigned char)((v >> 8) & 0xFF);
+    b[p] = (unsigned char)((v >> 8) & 0xFF);
+    b[p + 1] = (unsigned char)(v & 0xFF);
 }
 static void mobiSet32(Bytes& b, size_t p, unsigned v) {
     if (p + 4 > b.size()) return;
-    b[p] = (unsigned char)(v & 0xFF);
-    b[p + 1] = (unsigned char)((v >> 8) & 0xFF);
-    b[p + 2] = (unsigned char)((v >> 16) & 0xFF);
-    b[p + 3] = (unsigned char)((v >> 24) & 0xFF);
+    b[p] = (unsigned char)((v >> 24) & 0xFF);
+    b[p + 1] = (unsigned char)((v >> 16) & 0xFF);
+    b[p + 2] = (unsigned char)((v >> 8) & 0xFF);
+    b[p + 3] = (unsigned char)(v & 0xFF);
+}
+/* код языка MOBI (младший байт — язык Windows LANG_*, подъязык 0) по коду ISO 639-1 */
+static unsigned mobiLocale(const std::string& lang) {
+    std::string l = lowerAscii(lang.substr(0, 2));
+    const struct { const char* iso; unsigned code; } t[] = {
+        {"ru", 0x19}, {"en", 0x09}, {"uk", 0x22}, {"be", 0x23}, {"de", 0x07}, {"fr", 0x0C},
+        {"es", 0x0A}, {"it", 0x10}, {"pl", 0x15}, {"cs", 0x05}, {"bg", 0x02}, {"sr", 0x1A},
+        {"kk", 0x3F}, {"ja", 0x11}, {"zh", 0x04}, {"pt", 0x16}, {"nl", 0x13}, {"fi", 0x0B},
+    };
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+        if (l == t[i].iso) return t[i].code;
+    return 0;
 }
 static Bytes mobiU32Bytes(unsigned v) {
     Bytes b;
@@ -1371,33 +1386,35 @@ static bool writeMOBI(Book& book, Bytes& out, std::string* err) {
         const size_t ffs[] = {0x18,0x1C,0x20,0x24,0x28,0x2C,0x30,0x34,0x38,0x3C};
         for (int i = 0; i < 10; i++) mobiSet32(r0, M + ffs[i], 0xFFFFFFFF);
     }
+    /* раскладка заголовка — как у Calibre (writer2/main.py) и kindlegen; смещения от «MOBI».
+       1.8: поля после 0xC4 стояли со сдвигом (флаги хвостов попадали в 0xDE), не было языка,
+       записей FLIS/FCIS и номера последней записи с картинками */
     unsigned firstNonBook = (unsigned)(1 + textRecords.size());
+    unsigned lastContent = (unsigned)(textRecords.size() + imageBytes.size());
+    unsigned flisRec = lastContent + 1, fcisRec = lastContent + 2;
     mobiSet32(r0, M + 0x40, firstNonBook);
     mobiSet32(r0, M + 0x44, 16 + 232 + exthLen);
     mobiSet32(r0, M + 0x48, (unsigned)titleBytes.size());
-    mobiSet32(r0, M + 0x4C, 9);
-    mobiSet32(r0, M + 0x50, 9);
-    mobiSet32(r0, M + 0x54, 9);
+    mobiSet32(r0, M + 0x4C, mobiLocale(m.lang));
+    mobiSet32(r0, M + 0x50, 0);                 /* языки словаря: нет */
+    mobiSet32(r0, M + 0x54, 0);
     mobiSet32(r0, M + 0x58, 6);
     mobiSet32(r0, M + 0x5C, imageBytes.empty() ? 0xFFFFFFFFu : firstNonBook);
-    mobiSet32(r0, M + 0x60, 0);
-    mobiSet32(r0, M + 0x64, 0);
-    mobiSet32(r0, M + 0x68, 0);
-    mobiSet32(r0, M + 0x6C, 0);
-    mobiSet32(r0, M + 0x70, 0x50);
-    mobiSet32(r0, M + 0x94, 0xFFFFFFFF);
+    mobiSet32(r0, M + 0x70, 0x50);              /* бит 0x40: есть EXTH */
+    mobiSet32(r0, M + 0x94, 0xFFFFFFFF);        /* DRM: нет */
     mobiSet32(r0, M + 0x98, 0xFFFFFFFF);
-    mobiSet16(r0, M + 0xB0, 1);
-    mobiSet16(r0, M + 0xB2, (unsigned)textRecords.size());
+    mobiSet16(r0, M + 0xB0, 1);                 /* первая и последняя запись содержимого */
+    mobiSet16(r0, M + 0xB2, lastContent);
     mobiSet32(r0, M + 0xB4, 1);
-    mobiSet32(r0, M + 0xB8, 0xFFFFFFFF);
-    mobiSet32(r0, M + 0xC0, 0xFFFFFFFF);
-    mobiSet32(r0, M + 0xC4, 0xFFFFFFFF);
-    mobiSet32(r0, M + 0xCC, 0xFFFFFFFF);
+    mobiSet32(r0, M + 0xB8, fcisRec);
+    mobiSet32(r0, M + 0xBC, 1);
+    mobiSet32(r0, M + 0xC0, flisRec);
+    mobiSet32(r0, M + 0xC4, 1);
     mobiSet32(r0, M + 0xD0, 0xFFFFFFFF);
-    mobiSet32(r0, M + 0xD4, 0xFFFFFFFF);
-    mobiSet16(r0, M + 0xDC, 0);
-    mobiSet32(r0, M + 0xDE, 0xFFFFFFFF);
+    mobiSet32(r0, M + 0xD8, 0xFFFFFFFF);
+    mobiSet32(r0, M + 0xDC, 0xFFFFFFFF);
+    mobiSet32(r0, M + 0xE0, 0);                 /* хвостов у текстовых записей нет */
+    mobiSet32(r0, M + 0xE4, 0xFFFFFFFF);        /* индекса (INDX) нет */
 
     /* EXTH */
     size_t P = M + 232;
@@ -1422,6 +1439,21 @@ static bool writeMOBI(Book& book, Bytes& out, std::string* err) {
     for (size_t i = 0; i < textRecords.size(); i++) records.push_back(textRecords[i]);
     for (size_t i = 0; i < imageBytes.size(); i++) records.push_back(imageBytes[i]);
     {
+        /* FLIS и FCIS: назначение не документировано, но kindlegen и Calibre пишут их всегда */
+        static const unsigned char flis[] = {
+            'F','L','I','S', 0,0,0,8, 0,0x41, 0,0, 0,0,0,0, 0xFF,0xFF,0xFF,0xFF,
+            0,1, 0,3, 0,0,0,3, 0,0,0,1, 0xFF,0xFF,0xFF,0xFF};
+        records.push_back(Bytes(flis, flis + sizeof(flis)));
+        static const unsigned char fcisHead[] = {
+            'F','C','I','S', 0,0,0,0x14, 0,0,0,0x10, 0,0,0,1, 0,0,0,0};
+        static const unsigned char fcisTail[] = {
+            0,0,0,0, 0,0,0,0x20, 0,0,0,8, 0,1, 0,1, 0,0,0,0};
+        Bytes fcis(fcisHead, fcisHead + sizeof(fcisHead));
+        mobiPut32(fcis, (unsigned)textBytes.size());
+        fcis.insert(fcis.end(), fcisTail, fcisTail + sizeof(fcisTail));
+        records.push_back(fcis);
+    }
+    {
         Bytes eof;
         eof.push_back(0xE9); eof.push_back(0x8E); eof.push_back(0x0D); eof.push_back(0x0A);
         records.push_back(eof);
@@ -1431,17 +1463,18 @@ static bool writeMOBI(Book& book, Bytes& out, std::string* err) {
     size_t headerSize = 78 + (size_t)numRecords * 8 + 2;
     Bytes pdb(headerSize, 0);
 
-    /* имя в кодировке файла: обрезаем по границе символа */
+    /* имя базы PalmDB — только латиница, цифры и «-», остальное «_», до 31 байта (как у Calibre).
+       1.8: раньше писался UTF-8 — старые устройства его здесь не ждут */
     {
-        std::string up = upperText(m.title);
         std::string nm;
-        for (size_t i = 0; i < up.size();) {
-            unsigned char ch = (unsigned char)up[i];
-            size_t len = ch < 0x80 ? 1 : ((ch & 0xE0) == 0xC0 ? 2 : ((ch & 0xF0) == 0xE0 ? 3 : 4));
-            if (nm.size() + len > 31) break;
-            nm.append(up, i, len);
-            i += len;
+        bool gap = false;
+        for (size_t i = 0; i < m.title.size() && nm.size() < 31; i++) {
+            unsigned char ch = (unsigned char)m.title[i];
+            if (isalnum(ch) && ch < 0x80) { nm += (char)ch; gap = false; }
+            else if (ch == '-') { nm += '-'; gap = false; }
+            else if (!gap && (ch < 0x80 || (ch & 0xC0) == 0xC0)) { nm += '_'; gap = true; }
         }
+        if (nm.empty() || nm == "_") nm = "book";
         for (size_t i = 0; i < nm.size(); i++) pdb[i] = (unsigned char)nm[i];
     }
     mobiSet16(pdb, 32, 0);
@@ -1461,7 +1494,8 @@ static bool writeMOBI(Book& book, Bytes& out, std::string* err) {
     size_t off = headerSize;
     for (unsigned i = 0; i < numRecords; i++) {
         mobiSet32(pdb, 78 + (size_t)i * 8, (unsigned)off);
-        mobiSet32(pdb, 78 + (size_t)i * 8 + 4, (i << 24));
+        /* 1.8: байт атрибутов 0 и 3-байтный id записи; раньше номер записи попадал в атрибуты */
+        mobiSet32(pdb, 78 + (size_t)i * 8 + 4, (2 * i) & 0x00FFFFFF);
         off += records[i].size();
     }
 

@@ -640,13 +640,20 @@ static std::string dropBackLinks(const std::string& html, const NoteRefs& refs) 
         if (end == std::string::npos) { out.append(html, pos, std::string::npos); break; }
         std::string frag = hrefFragment(html.substr(a + 9, q - a - 9));
         std::string inner = collapse(htmlToText(html.substr(gt + 1, end - gt - 1)));
+        /* 1.8: «←1» — обратная ссылка в сносках MOBI от Calibre; раньше она оставалась и
+           сноска состояла из одной стрелки */
         bool back = refs.refAnchors.count(frag) || inner == "\xE2\x86\xA9" || inner == "\xE2\x86\xA9\xEF\xB8\x8E" ||
-                    inner == "^" || inner == "\xE2\x86\x91" || toLowerRu(inner) == "назад" || toLowerRu(inner) == "back";
+                    inner == "^" || inner == "\xE2\x86\x91" || toLowerRu(inner) == "назад" || toLowerRu(inner) == "back" ||
+                    startsWith(inner, "\xE2\x86\x90");
         out.append(html, pos, a - pos);
         if (!back) out.append(html, a, end + 4 - a);
         pos = end + 4;
     }
-    return trim(replaceAll(out, "<sup></sup>", ""));
+    out = replaceAll(out, "<sup></sup>", "");
+    /* скобки, в которых стояла обратная ссылка: «[←1]» -> «[]» */
+    std::string t = trim(out);
+    if (t == "[]" || t == "()" || t == "[ ]") return std::string();
+    return t;
 }
 
 /* номер в начале сноски: «<a …>1</a> Текст», «[1] Текст», «1. Текст» — в заголовок сноски */
@@ -704,6 +711,45 @@ static void extractNotesRec(const MNode* n, std::vector<const MNode*>& path, con
                     }
                     if (bl[b].type == Block::IMG || hasVisibleText(bl[b].html) || !bl[b].blocks.empty())
                         note.blocks.push_back(bl[b]);
+                }
+                /* 1.8: якорь сноски стоит на строке с одной обратной ссылкой, а текст идёт
+                   следующими блоками (так пишет Calibre: «[←1]», затем <blockquote> с текстом).
+                   Раньше в сноску попадала только стрелка, а текст оставался в основном тексте.
+                   Берём следующие блоки до разрыва страницы, заголовка или следующей сноски. */
+                if (note.blocks.empty() && box == k) {
+                    size_t taken2 = 0;
+                    for (size_t s = i + 1; s < n->kids.size() && taken2 < 20; s++) {
+                        const MNode* sib = n->kids[s].get();
+                        if (sib->text) {
+                            if (collapse(sib->value).empty()) continue;
+                            break;
+                        }
+                        const std::string& sn = sib->name;
+                        if (sn == "mbp:pagebreak" || (sn.size() == 2 && sn[0] == 'h' && isdigit((unsigned char)sn[1])))
+                            break;
+                        std::string sid = sib->attr("id");
+                        if (!sid.empty() && refs.label.count(sid)) break;
+                        if (!noteBoxOk(sib)) break;
+                        std::vector<Block> more;
+                        if (sib->name == "p") more.push_back(Block::p(inlineHtmlOf(sib, ctx)));
+                        else more = blocksOf(sib, ctx);
+                        /* отступ <blockquote> у Calibre — оформление, а не цитата: раскрываем */
+                        for (size_t b = 0; b < more.size(); b++) {
+                            if (more[b].type == Block::QUOTE && !more[b].blocks.empty()) {
+                                std::vector<Block> inner = more[b].blocks;
+                                more.erase(more.begin() + b);
+                                more.insert(more.begin() + b, inner.begin(), inner.end());
+                                b--;
+                            }
+                        }
+                        for (size_t b = 0; b < more.size(); b++) {
+                            more[b].html = dropBackLinks(more[b].html, refs);
+                            if (more[b].type == Block::IMG || hasVisibleText(more[b].html) || !more[b].blocks.empty())
+                                note.blocks.push_back(more[b]);
+                        }
+                        skip.insert(sib);
+                        taken2++;
+                    }
                 }
                 if (note.title.empty()) note.title = lab->second;
                 taken.insert(id);
@@ -763,6 +809,15 @@ static void finishHtmlBook(Book& book) {
                     has = true;
             if (!has) book.chapters.erase(book.chapters.begin() + i);
         }
+        /* 1.8: заголовок раздела сносок абзацем в конце главы («Заметки» в MOBI от Calibre) —
+           сами сноски ушли в сноски книги, от раздела остался одинокий заголовок */
+        for (size_t i = 0; i < book.chapters.size(); i++) {
+            std::vector<Block>& bl = book.chapters[i].blocks;
+            while (!bl.empty() && (bl.back().type == Block::EMPTY ||
+                                   (bl.back().type == Block::P && !hasVisibleText(bl.back().html))))
+                bl.pop_back();
+            if (!bl.empty() && bl.back().type == Block::P && isNotesTitle(bl.back().html)) bl.pop_back();
+        }
     }
     /* единственный заголовок верхнего уровня, совпадающий с названием книги, — это название,
        а не раздел: «<h1>Книга</h1><h2>Глава 1</h2>…» */
@@ -778,6 +833,20 @@ static void finishHtmlBook(Book& book) {
         toLowerRu(collapse(htmlToText(book.chapters[top].title))) == want) {
         book.chapters[top].title.clear();
         if (book.chapters[top].blocks.empty()) book.chapters.erase(book.chapters.begin() + top);
+    }
+    /* 1.8: первый абзац книги, повторяющий её название (титул, который Calibre пишет в начало
+       MOBI крупным шрифтом), — это не текст: название уже есть в описании книги */
+    for (size_t i = 0; i < book.chapters.size() && !want.empty(); i++) {
+        std::vector<Block>& bl = book.chapters[i].blocks;
+        if (!book.chapters[i].title.empty() && i > 0) break;
+        size_t k = 0;
+        while (k < bl.size() && bl[k].type == Block::EMPTY) k++;
+        if (k < bl.size() && bl[k].type == Block::P &&
+            toLowerRu(collapse(htmlToText(bl[k].html))) == want) {
+            bl.erase(bl.begin() + (long)k);
+            if (bl.empty() && book.chapters[i].title.empty()) book.chapters.erase(book.chapters.begin() + (long)i);
+        }
+        break;
     }
     normalizeChapterLevels(book.chapters);
 }
@@ -2645,17 +2714,268 @@ static Bytes palmdocDecompress(const Bytes& src) {
             if (dist == 0 || dist > out.size()) break;
             for (unsigned k = 0; k < len; k++) out.push_back(out[out.size() - dist]);
         } else {
-            unsigned n = (c & 0x3F) + 1;
-            for (unsigned k = 0; k < n; k++) out.push_back(0x20);
+            /* 0xC0–0xFF: пробел и символ (байт XOR 0x80).
+               1.8: раньше здесь выдавалось (c & 0x3F) + 1 пробелов — сжатый текст из kindlegen и
+               Calibre терял буквы после пробелов */
+            out.push_back(0x20);
+            out.push_back((unsigned char)(c ^ 0x80));
         }
     }
     return out;
 }
 
+/* Сколько байт в конце текстовой записи занимают «хвосты» (extra record data): kindlegen и
+   Calibre дописывают их по флагам из заголовка MOBI. Бит 0 — перекрывающиеся байты
+   многобайтного символа, остальные биты — записи с длиной в обратном base-128 в самом конце.
+   1.8: раньше хвосты не срезались и попадали в текст мусором. */
+static size_t mobiTrailingSize(const Bytes& rec, unsigned flags) {
+    size_t size = rec.size(), num = 0;
+    for (unsigned f = flags >> 1; f; f >>= 1) {
+        if (!(f & 1)) continue;
+        if (num >= size) return size;
+        /* размер записи: байты с конца, по 7 бит, последний (первый с конца) помечен 0x80 */
+        size_t psize = size - num, entry = 0;
+        unsigned bitpos = 0;
+        for (;;) {
+            unsigned char v = rec[psize - 1];
+            entry |= (size_t)(v & 0x7F) << bitpos;
+            bitpos += 7;
+            psize--;
+            if ((v & 0x80) || bitpos >= 28 || psize == 0) break;
+        }
+        num += entry;
+    }
+    if ((flags & 1) && num < size) num += (rec[size - num - 1] & 0x3) + 1;
+    return num > size ? size : num;
+}
+
 /* Ссылки MOBI <a filepos="0000123"> указывают байтовое смещение в распакованном тексте.
    Ставим в эти места якоря id="fpN" (в сам тег, если смещение попадает на него) и
    переписываем ссылки в href="#fpN". Вставка идёт с конца, чтобы смещения не съезжали. */
-static void mobiResolveFilepos(std::string& raw) {
+/* Оглавление MOBI (индекс NCX): записи INDX + TAGX + IDXT + строки CNCX.
+   1.8: раньше не читалось — у MOBI из Calibre и kindlegen заголовки глав в тексте не <h1>,
+   а абзацы с <font size>, и оглавление терялось. Разбор — по описанию формата в Calibre
+   (src/calibre/ebooks/mobi/reader/index.py). */
+struct NcxEntry { size_t offset; std::string label; int depth; NcxEntry() : offset(0), depth(0) {} };
+
+/* число переменной длины: по 7 бит, старший бит отмечает последний байт */
+static size_t mobiDecint(const unsigned char* p, size_t n, unsigned& val) {
+    val = 0;
+    for (size_t i = 0; i < n && i < 5; i++) {
+        val = (val << 7) | (p[i] & 0x7F);
+        if (p[i] & 0x80) return i + 1;
+    }
+    return 0;
+}
+
+static unsigned beAt(const Bytes& r, size_t p, int n) {
+    if (p > r.size() || (size_t)n > r.size() - p) return 0;
+    unsigned v = 0;
+    for (int i = 0; i < n; i++) v = (v << 8) | r[p + i];
+    return v;
+}
+
+static void mobiReadNcx(const Bytes& b, const std::vector<unsigned>& offsets, unsigned indx,
+                        std::vector<NcxEntry>& out) {
+    struct Rec {
+        static Bytes get(const Bytes& b, const std::vector<unsigned>& o, size_t i) {
+            if (i + 1 >= o.size() || o[i] >= o[i + 1] || o[i + 1] > b.size()) return Bytes();
+            return Bytes(b.begin() + o[i], b.begin() + o[i + 1]);
+        }
+    };
+    if (indx == 0 || indx + 1 >= offsets.size()) return;
+    Bytes prim = Rec::get(b, offsets, indx);
+    if (prim.size() < 56 || memcmp(&prim[0], "INDX", 4) != 0) return;
+    unsigned indexRecs = beAt(prim, 24, 4), ncncx = beAt(prim, 52, 4);
+    if (indexRecs > 1000 || ncncx > 1000) return;
+
+    /* TAGX: сразу за заголовком; на всякий случай ищем по сигнатуре */
+    size_t tx = beAt(prim, 4, 4);
+    if (tx + 12 > prim.size() || memcmp(&prim[tx], "TAGX", 4) != 0) {
+        tx = std::string::npos;
+        for (size_t i = 0; i + 12 <= prim.size(); i++)
+            if (memcmp(&prim[i], "TAGX", 4) == 0) { tx = i; break; }
+        if (tx == std::string::npos) return;
+    }
+    unsigned tagxLen = beAt(prim, tx + 4, 4), cbc = beAt(prim, tx + 8, 4);
+    if (tagxLen < 12 || tx + tagxLen > prim.size() || cbc == 0 || cbc > 8) return;
+    struct Tag { unsigned tag, perEntry, mask, eof; };
+    std::vector<Tag> tags;
+    for (size_t p = tx + 12; p + 4 <= tx + tagxLen; p += 4) {
+        Tag t = {prim[p], prim[p + 1], prim[p + 2], prim[p + 3]};
+        tags.push_back(t);
+    }
+
+    /* строки CNCX: длина (число переменной длины) + UTF-8; смещение = позиция + 0x10000 * номер записи */
+    std::map<unsigned, std::string> cncx;
+    for (unsigned k = 0; k < ncncx; k++) {
+        Bytes c = Rec::get(b, offsets, indx + indexRecs + 1 + k);
+        size_t p = 0;
+        while (p < c.size()) {
+            unsigned len = 0;
+            size_t used = mobiDecint(&c[p], c.size() - p, len);
+            if (!used || len > c.size() - p - used) break;
+            if (len) cncx[(unsigned)p + 0x10000u * k] = std::string((const char*)&c[p + used], len);
+            p += used + len;
+        }
+    }
+
+    for (unsigned r = 1; r <= indexRecs; r++) {
+        Bytes d = Rec::get(b, offsets, indx + r);
+        if (d.size() < 28 || memcmp(&d[0], "INDX", 4) != 0) continue;
+        unsigned idxt = beAt(d, 20, 4), count = beAt(d, 24, 4);
+        if (idxt + 4 > d.size() || count > 65535 || (size_t)idxt + 4 + 2 * (size_t)count > d.size()) continue;
+        for (unsigned j = 0; j < count; j++) {
+            size_t s = beAt(d, idxt + 4 + 2 * j, 2);
+            size_t e = j + 1 < count ? beAt(d, idxt + 4 + 2 * (j + 1), 2) : idxt;
+            if (s >= e || e > d.size()) continue;
+            size_t p = s;
+            p += 1 + d[p];                                  /* имя записи: длина + байты */
+            if (p + cbc > e) continue;
+            std::vector<unsigned> cb(d.begin() + p, d.begin() + p + cbc);
+            p += cbc;
+            /* какие теги есть в записи и сколько у них значений */
+            struct PTag { unsigned tag, count, bytes, perEntry; };
+            std::vector<PTag> ptags;
+            size_t ci = 0;
+            for (size_t t = 0; t < tags.size(); t++) {
+                if (tags[t].eof) { ci++; continue; }
+                if (ci >= cb.size() || !tags[t].mask) continue;
+                unsigned value = cb[ci] & tags[t].mask;
+                if (!value) continue;
+                PTag pt = {tags[t].tag, 0, 0, tags[t].perEntry};
+                unsigned bits = 0;
+                for (unsigned m = tags[t].mask; m; m >>= 1) bits += m & 1;
+                if (value == tags[t].mask) {
+                    if (bits > 1) {
+                        unsigned v = 0;
+                        size_t used = mobiDecint(&d[p], e - p, v);
+                        if (!used) break;
+                        p += used;
+                        pt.bytes = v;
+                    } else {
+                        pt.count = 1;
+                    }
+                } else {
+                    unsigned m = tags[t].mask;
+                    while (!(m & 1)) { m >>= 1; value >>= 1; }
+                    pt.count = value;
+                }
+                ptags.push_back(pt);
+            }
+            std::map<unsigned, std::vector<unsigned> > tm;
+            bool broken = false;
+            for (size_t t = 0; t < ptags.size() && !broken; t++) {
+                std::vector<unsigned>& vals = tm[ptags[t].tag];
+                if (ptags[t].count) {
+                    for (unsigned k = 0; k < ptags[t].count * ptags[t].perEntry && k < 64; k++) {
+                        unsigned v = 0;
+                        size_t used = p < e ? mobiDecint(&d[p], e - p, v) : 0;
+                        if (!used) { broken = true; break; }
+                        p += used;
+                        vals.push_back(v);
+                    }
+                } else {
+                    size_t consumed = 0;
+                    while (consumed < ptags[t].bytes) {
+                        unsigned v = 0;
+                        size_t used = p < e ? mobiDecint(&d[p], e - p, v) : 0;
+                        if (!used) { broken = true; break; }
+                        p += used;
+                        consumed += used;
+                        vals.push_back(v);
+                    }
+                }
+            }
+            /* теги NCX: 1 — смещение в тексте, 3 — подпись в CNCX, 4 — глубина */
+            if (broken || tm[1].empty() || tm[3].empty()) continue;
+            std::map<unsigned, std::string>::iterator lab = cncx.find(tm[3][0]);
+            if (lab == cncx.end()) continue;
+            NcxEntry ne;
+            ne.offset = tm[1][0];
+            ne.label = collapse(lab->second);
+            ne.depth = tm[4].empty() ? 0 : (int)std::min(tm[4][0], 8u);
+            if (!ne.label.empty()) out.push_back(ne);
+        }
+    }
+}
+
+/* 1.8: страница «Table of Contents», которую Calibre и kindlegen вставляют в сам текст
+   (<guide><reference type="toc" filepos=N>), раньше попадала в книгу списком ссылок — хотя
+   оглавление и так строится из глав. Она забивается пробелами той же длины: байтовые
+   смещения filepos и NCX после неё не сдвигаются. Только если там действительно ссылки. */
+static void mobiBlankHtmlToc(std::string& raw) {
+    std::string head = lowerAscii(raw.substr(0, std::min<size_t>(raw.size(), 4096)));
+    size_t r = head.find("<reference");
+    while (r != std::string::npos) {
+        size_t e = head.find('>', r);
+        if (e == std::string::npos) return;
+        std::string tag = head.substr(r, e - r);
+        if (tag.find("type=\"toc\"") != std::string::npos || tag.find("type=toc") != std::string::npos) {
+            size_t f = tag.find("filepos=");
+            if (f == std::string::npos) return;
+            size_t p = f + 8;
+            if (p < tag.size() && (tag[p] == '"' || tag[p] == '\'')) p++;
+            size_t at = 0;
+            while (p < tag.size() && isdigit((unsigned char)tag[p])) at = at * 10 + (size_t)(tag[p++] - '0');
+            if (at == 0 || at >= raw.size()) return;
+            std::string low = lowerAscii(raw.substr(at, 200000));
+            size_t end = low.find("<mbp:pagebreak");
+            size_t body = low.find("</body>");
+            if (end == std::string::npos || (body != std::string::npos && body < end)) end = body;
+            if (end == std::string::npos) end = low.size();
+            std::string part = low.substr(0, end);
+            size_t links = 0;
+            for (size_t q = part.find("filepos="); q != std::string::npos; q = part.find("filepos=", q + 8)) links++;
+            /* оглавление — это почти одни ссылки: не меньше двух и мало текста вне них */
+            if (links < 2 || htmlToText(part).size() > links * 200) return;
+            for (size_t i = 0; i < end; i++) raw[at + i] = ' ';
+            return;
+        }
+        r = head.find("<reference", e);
+    }
+}
+
+/* Номер размера шрифта первого <font size="N"> в куске HTML, 0 — нет */
+static int mobiFontSize(const std::string& low) {
+    size_t f = low.find("<font size=");
+    if (f == std::string::npos) return 0;
+    size_t p = f + 11;
+    if (p < low.size() && (low[p] == '"' || low[p] == '\'')) p++;
+    int v = 0;
+    while (p < low.size() && isdigit((unsigned char)low[p])) v = v * 10 + (low[p++] - '0');
+    return v;
+}
+
+static void mobiResolveFilepos(std::string& raw, const std::vector<NcxEntry>& ncx) {
+    /* заголовки по оглавлению NCX: абзац на смещении записи становится <hN> (если его текст —
+       это и есть подпись записи), иначе <hN> с подписью вставляется перед ним */
+    std::map<size_t, std::pair<std::string, int> > heads;
+    {
+        bool anyDepth = false;
+        for (size_t i = 0; i < ncx.size(); i++) if (ncx[i].depth > 0) anyDepth = true;
+        /* у MOBI6 от Calibre глубина везде 0 — уровень по размеру шрифта заголовка */
+        std::set<int> sizes;
+        std::vector<int> sz(ncx.size(), 0);
+        for (size_t i = 0; i < ncx.size(); i++) {
+            if (ncx[i].offset >= raw.size()) continue;
+            std::string head = lowerAscii(raw.substr(ncx[i].offset, 400));
+            size_t e = head.find("</p>");
+            sz[i] = mobiFontSize(e == std::string::npos ? head : head.substr(0, e));
+            if (sz[i]) sizes.insert(sz[i]);
+        }
+        for (size_t i = 0; i < ncx.size(); i++) {
+            if (ncx[i].offset >= raw.size()) continue;
+            int level = 1;
+            if (anyDepth) level = ncx[i].depth + 1;
+            else if (sz[i]) {
+                level = 1;
+                for (std::set<int>::reverse_iterator it = sizes.rbegin(); it != sizes.rend() && *it > sz[i]; ++it) level++;
+            } else if (!sizes.empty()) level = (int)sizes.size();
+            heads[ncx[i].offset] = std::make_pair(ncx[i].label, std::min(level, 6));
+        }
+    }
+
     std::string low = lowerAscii(raw);
     std::set<size_t> targets;
     size_t pos = 0;
@@ -2671,11 +2991,38 @@ static void mobiResolveFilepos(std::string& raw) {
         if (digits && v < raw.size()) targets.insert(v);
         pos = p;
     }
-    if (targets.empty()) return;
+    if (targets.empty() && heads.empty()) return;
 
-    for (std::set<size_t>::reverse_iterator it = targets.rbegin(); it != targets.rend(); ++it) {
+    /* правки идут с конца текста, чтобы байтовые смещения перед ними не съезжали */
+    std::set<size_t> all(targets);
+    for (std::map<size_t, std::pair<std::string, int> >::iterator h = heads.begin(); h != heads.end(); ++h)
+        all.insert(h->first);
+    for (std::set<size_t>::reverse_iterator it = all.rbegin(); it != all.rend(); ++it) {
         size_t at = *it;
         std::string id = "fp" + intToStr((long long)at);
+        bool isTarget = targets.count(at) != 0;
+        std::map<size_t, std::pair<std::string, int> >::iterator h = heads.find(at);
+        if (h != heads.end()) {
+            std::string hn = "h" + intToStr(h->second.second);
+            std::string idAttr = isTarget ? " id=\"" + id + "\"" : std::string();
+            std::string tag = "<" + hn + idAttr + ">" + escHtml(h->second.first) + "</" + hn + ">";
+            /* абзац-заголовок целиком заменяется, если в нём ровно подпись и нет других якорей */
+            size_t end = std::string::npos;
+            if (raw.compare(at, 2, "<p") == 0 || raw.compare(at, 2, "<P") == 0) {
+                size_t close = lowerAscii(raw.substr(at, 2000)).find("</p>");
+                if (close != std::string::npos) {
+                    std::string inner = raw.substr(at, close + 4);
+                    bool otherTarget = false;
+                    std::set<size_t>::iterator nx = all.upper_bound(at);
+                    if (nx != all.end() && *nx < at + close + 4) otherTarget = true;
+                    if (!otherTarget && toLowerRu(collapse(htmlToText(inner))) == toLowerRu(h->second.first))
+                        end = at + close + 4;
+                }
+            }
+            if (end != std::string::npos) raw.replace(at, end - at, tag);
+            else raw.insert(at, tag);
+            continue;
+        }
         if (raw[at] == '<' && at + 1 < raw.size() && isalpha((unsigned char)raw[at + 1])) {
             size_t e = at + 1;
             while (e < raw.size() && (isalnum((unsigned char)raw[e]) || raw[e] == ':')) e++;
@@ -2710,8 +3057,9 @@ static void mobiResolveFilepos(std::string& raw) {
 
 static bool isNotesTitle(const std::string& titleHtml) {
     std::string t = toLowerRu(collapse(htmlToText(titleHtml)));
+    /* 1.8: «заметки» — так Calibre по-русски озаглавливает сноски в MOBI */
     return t == "примечания" || t == "сноски" || t == "комментарии" || t == "примечания и комментарии" ||
-           t == "notes" || t == "footnotes" || t == "endnotes";
+           t == "заметки" || t == "notes" || t == "footnotes" || t == "endnotes";
 }
 
 /* Раздел «Примечания», на абзацы которого ведут ссылки, -> настоящие сноски книги. */
@@ -2766,7 +3114,9 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
         if (err) *err = "Файл слишком мал для MOBI";
         return false;
     }
-    unsigned numRecords = (unsigned)b[76] | ((unsigned)b[77] << 8);
+    /* PalmDB и MOBI — big-endian. 1.8: раньше читалось как little-endian, поэтому настоящие
+       MOBI из Calibre и kindlegen не открывались («Повреждён первый блок MOBI») */
+    unsigned numRecords = ((unsigned)b[76] << 8) | (unsigned)b[77];
     if (numRecords < 2) {
         if (err) *err = "Повреждён заголовок PalmDB";
         return false;
@@ -2775,8 +3125,8 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     for (unsigned i = 0; i < numRecords; i++) {
         size_t p = 78 + i * 8;
         if (p + 4 > b.size()) break;
-        offsets.push_back((unsigned)b[p] | ((unsigned)b[p + 1] << 8) |
-                          ((unsigned)b[p + 2] << 16) | ((unsigned)b[p + 3] << 24));
+        offsets.push_back(((unsigned)b[p] << 24) | ((unsigned)b[p + 1] << 16) |
+                          ((unsigned)b[p + 2] << 8) | (unsigned)b[p + 3]);
     }
     offsets.push_back((unsigned)b.size());
     if (offsets.size() < 3) {
@@ -2790,8 +3140,8 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
         return false;
     }
     Bytes r0(b.begin() + r0start, b.begin() + r0end);
-    #define R0U16(p) ((unsigned)(((p) + 2 <= r0.size()) ? ((unsigned)r0[p] | ((unsigned)r0[p+1] << 8)) : 0))
-    #define R0U32(p) ((unsigned)(((p) + 4 <= r0.size()) ? ((unsigned)r0[p] | ((unsigned)r0[p+1] << 8) | ((unsigned)r0[p+2] << 16) | ((unsigned)r0[p+3] << 24)) : 0))
+    #define R0U16(p) ((unsigned)(((p) + 2 <= r0.size()) ? (((unsigned)r0[p] << 8) | (unsigned)r0[p+1]) : 0))
+    #define R0U32(p) ((unsigned)(((p) + 4 <= r0.size()) ? (((unsigned)r0[p] << 24) | ((unsigned)r0[p+1] << 16) | ((unsigned)r0[p+2] << 8) | (unsigned)r0[p+3]) : 0))
 
     unsigned compression = R0U16(0);
     unsigned encryption = R0U16(12);
@@ -2803,14 +3153,20 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     unsigned encoding = 1252;
     unsigned fullNameOffset = 0, fullNameLength = 0, exthFlags = 0, firstImageIndex = 0;
     unsigned mobiVersion = 6;
+    unsigned extraFlags = 0;   /* какие «хвосты» дописаны в конец каждой текстовой записи */
+    unsigned ncxIndex = 0xFFFFFFFFu;
 
     if (r0.size() >= 20 && r0[16] == 'M' && r0[17] == 'O' && r0[18] == 'B' && r0[19] == 'I') {
+        unsigned headerLen = R0U32(16 + 4);
         encoding = R0U32(16 + 12);
         mobiVersion = R0U32(16 + 20);
         fullNameOffset = R0U32(16 + 0x44);
         fullNameLength = R0U32(16 + 0x48);
         firstImageIndex = R0U32(16 + 0x5C);
         exthFlags = R0U32(16 + 0x70);
+        /* как в Calibre: флаги есть при длине заголовка от 0xE4, значимы младшие 16 бит */
+        if (headerLen >= 0xE4) extraFlags = R0U16(16 + 0xE2);
+        if (headerLen >= 0xE8) ncxIndex = R0U32(16 + 0xE4);   /* запись INDX оглавления */
     }
     if (mobiVersion >= 8) {
         if (err) *err = "Это AZW3/KF8 — такие файлы здесь не читаются. Сконвертируйте их в FB2 через Calibre.";
@@ -2820,7 +3176,10 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     book.fileName = fileName;
 
     std::string title;
-    if (fullNameLength && fullNameOffset && fullNameOffset + fullNameLength <= r0.size()) {
+    /* 1.8: проверки без сложения — в 32-битной сборке offset + length из битого файла
+       переполнялись, проходили проверку и роняли программу (нашёл fuzz.ps1) */
+    if (fullNameLength && fullNameOffset && fullNameOffset < r0.size() &&
+        fullNameLength <= r0.size() - fullNameOffset) {
         std::string raw((const char*)&r0[fullNameOffset], fullNameLength);
         title = (encoding == 65001) ? raw : cpToUtf8(raw, 1252);
         while (!title.empty() && title[title.size() - 1] == '\0') title.erase(title.size() - 1);
@@ -2828,7 +3187,8 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
 
     long coverOffset = -1;
     if (exthFlags & 0x40) {
-        size_t base = 16 + R0U32(16 + 4);
+        unsigned mobiLen = R0U32(16 + 4);
+        size_t base = mobiLen < r0.size() ? 16 + (size_t)mobiLen : r0.size();
         if (base + 12 <= r0.size() && r0[base] == 'E' && r0[base + 1] == 'X' &&
             r0[base + 2] == 'T' && r0[base + 3] == 'H') {
             unsigned count = R0U32(base + 8);
@@ -2836,7 +3196,7 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
             for (unsigned i = 0; i < count && p + 8 <= r0.size(); i++) {
                 unsigned type = R0U32(p);
                 unsigned len = R0U32(p + 4);
-                if (len < 8 || p + len > r0.size()) break;
+                if (len < 8 || len > r0.size() - p) break;
                 std::string raw((const char*)&r0[p + 8], len - 8);
                 std::string val = raw;
                 if (type == 100 && !raw.empty()) {
@@ -2876,6 +3236,8 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
         size_t a = offsets[i], z = offsets[i + 1];
         if (a > b.size() || z > b.size() || z < a) break;
         Bytes rec(b.begin() + a, b.begin() + z);
+        size_t tail = mobiTrailingSize(rec, extraFlags);
+        rec.resize(tail < rec.size() ? rec.size() - tail : 0);
         if (compression == 1) {
             textBytes.insert(textBytes.end(), rec.begin(), rec.end());
         } else if (compression == 2) {
@@ -2893,7 +3255,10 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     std::string rawText;
     {
         std::string rawAll((const char*)&textBytes[0], textBytes.size());
-        mobiResolveFilepos(rawAll);
+        std::vector<NcxEntry> ncx;
+        if (ncxIndex != 0xFFFFFFFFu) mobiReadNcx(b, offsets, ncxIndex, ncx);
+        mobiBlankHtmlToc(rawAll);
+        mobiResolveFilepos(rawAll, ncx);
         if (encoding == 65001) {
             rawText = rawAll;
         } else {

@@ -170,6 +170,10 @@ function Fb2Facts([string]$fb2) {
         table2 = if ($tables.Count -ge 2) { $tables[1] } else { '' }
         tree   = (@($tree) -join "`n")
         title  = $x.SelectSingleNode('//f:title-info/f:book-title', $ns).InnerText
+        # first author as "last|first|middle": checks how a name was split into fields
+        author = @($x.SelectNodes('//f:title-info/f:author', $ns) | Select-Object -First 1 | ForEach-Object {
+                     ($_.SelectSingleNode('f:last-name', $ns).InnerText, $_.SelectSingleNode('f:first-name', $ns).InnerText,
+                      $(if ($_.SelectSingleNode('f:middle-name', $ns)) { $_.SelectSingleNode('f:middle-name', $ns).InnerText } else { '' })) -join '|' }) -join ''
         series = if ($seq) { "$($seq.GetAttribute('name'))#$($seq.GetAttribute('number'))" } else { '' }
         notes  = $ids.Count
         links  = $links
@@ -216,6 +220,7 @@ foreach ($exp in $expects) {
         $k = $Matches[1]; $v = $Matches[2]
         switch ($k) {
             'title'  { if ($facts.title -ne $v) { $problems += "title: want '$v' got '$($facts.title)'" } }
+            'author' { if ($facts.author -ne $v) { $problems += "author (last|first|middle): want '$v' got '$($facts.author)'" } }
             'images' { if ($facts.images -ne [int]$v) { $problems += "images: want $v got $($facts.images)" } }
             'table'  { if ($facts.table -ne $v) { $problems += "table:`n    want: $v`n    got:  $($facts.table)" } }
             'table2' { if ($facts.table2 -ne $v) { $problems += "table2:`n    want: $v`n    got:  $($facts.table2)" } }
@@ -314,6 +319,43 @@ if (Test-Path $nt) {
         $pass++; Write-Host "OK    DjVu without text layer -> refused with a reason"
     } else { $fail++; Write-Host "FAIL  DjVu without text layer: exit $LASTEXITCODE, $($log.Trim())" -ForegroundColor Red }
 }
+
+# 3e) every MOBI written above must be valid by the format description itself (big-endian
+#     PalmDB, record 0, MOBI header, EXTH, FLIS/FCIS, EOF record), not just readable by our own
+#     reader: until 1.8 writer and reader were both little-endian and the round trips passed.
+function BE16([byte[]]$b, [long]$p) { ([int]$b[$p] -shl 8) -bor $b[$p + 1] }
+function BE32([byte[]]$b, [long]$p) { ([long]$b[$p] -shl 24) -bor ([long]$b[$p + 1] -shl 16) -bor ([long]$b[$p + 2] -shl 8) -bor [long]$b[$p + 3] }
+$mobis = @(Get-ChildItem $work -Recurse -Filter *.mobi)
+$badMobi = @()
+foreach ($m in $mobis) {
+    $b = [IO.File]::ReadAllBytes($m.FullName)
+    $why = @()
+    $n = BE16 $b 76
+    $offs = @(for ($i = 0; $i -lt $n; $i++) { BE32 $b (78 + 8 * $i) })
+    if ([Text.Encoding]::ASCII.GetString($b, 60, 8) -ne 'BOOKMOBI') { $why += 'type' }
+    if ($n -lt 3 -or $offs[0] -ne 78 + 8 * $n + 2) { $why += 'record list' }
+    for ($i = 1; $i -lt $n; $i++) { if ($offs[$i] -lt $offs[$i - 1] -or $offs[$i] -gt $b.Length) { $why += "offset $i"; break } }
+    if (-not $why) {
+        $r0 = $offs[0]; $M = $r0 + 16
+        $comp = BE16 $b $r0; $textLen = BE32 $b ($r0 + 4); $textRecs = BE16 $b ($r0 + 8)
+        if ($comp -ne 1 -and $comp -ne 2) { $why += "compression $comp" }
+        if ([Text.Encoding]::ASCII.GetString($b, $M, 4) -ne 'MOBI' -or (BE32 $b ($M + 4)) -ne 232) { $why += 'MOBI header' }
+        if ((BE32 $b ($M + 12)) -ne 65001) { $why += 'codepage' }
+        if ((BE32 $b ($M + 0x40)) -ne $textRecs + 1) { $why += 'first non-book record' }
+        $sum = 0; for ($i = 1; $i -le $textRecs; $i++) { $sum += $offs[$i + 1] - $offs[$i] }
+        if ($comp -eq 1 -and $sum -ne $textLen) { $why += "text length $sum vs $textLen" }
+        if ([Text.Encoding]::ASCII.GetString($b, $M + 232, 4) -ne 'EXTH') { $why += 'EXTH' }
+        foreach ($k in @(@(0xC0, 'FLIS'), @(0xB8, 'FCIS'))) {
+            $idx = BE32 $b ($M + $k[0])
+            if ($idx -ge $n -or [Text.Encoding]::ASCII.GetString($b, $offs[$idx], 4) -ne $k[1]) { $why += $k[1] }
+        }
+        $e = $offs[$n - 1]
+        if (-not ($b[$e] -eq 0xE9 -and $b[$e + 1] -eq 0x8E -and $b[$e + 2] -eq 0x0D -and $b[$e + 3] -eq 0x0A)) { $why += 'EOF record' }
+    }
+    if ($why) { $badMobi += "$($m.Name): $($why -join ', ')" }
+}
+if ($mobis.Count -and -not $badMobi) { $pass++; Write-Host "OK    MOBI format: $($mobis.Count) written files valid by the format description" }
+else { $fail++; Write-Host "FAIL  MOBI format ($($mobis.Count) files): $($badMobi -join ' | ')" -ForegroundColor Red }
 
 # 5) console mode of the GUI exe: output reaches a pipe, exit codes are right
 $ver = (& $cli -v | Out-String).Trim()

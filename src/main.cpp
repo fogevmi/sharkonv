@@ -4,7 +4,7 @@
 
 int runGui(HINSTANCE hInst, const std::vector<std::wstring>& files);
 
-#define APP_VERSION L"1.7"
+#define APP_VERSION L"1.8"
 
 /* --------------------------- вывод в консоль ---------------------------- */
 

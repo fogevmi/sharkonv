@@ -462,6 +462,9 @@ std::string htmlToText(const std::string& html) {
         std::string nm = tag.substr(0, p);
         bool closing = !nm.empty() && nm[0] == '/';
         std::string bare = closing ? nm.substr(1) : nm;
+        /* 1.8: «<br/>» давал имя «br/» и перенос выбрасывался — в TXT склеивались слова на
+           переносе строки в абзаце или ячейке таблицы («крепостного<br/>права» -> «крепостногоправа») */
+        while (!bare.empty() && bare[bare.size() - 1] == '/') bare.erase(bare.size() - 1);
 
         if (bare == "br") s += '\n';
         else if (bare == "p" && closing) s += "\n\n";
@@ -778,6 +781,22 @@ std::string fullName(const Author& a) {
 Author splitAuthor(const std::string& name, bool familyFirst) {
     Author a;
     std::string n = collapse(name);
+    /* 1.8: «Фамилия, Имя Отчество» — так автор записан во многих MOBI, EPUB и DOC. Раньше
+       запятая оставалась в имени: «Акулов, Сергей» давало имя «Акулов,» и фамилию «Сергей».
+       Запятая однозначно отделяет фамилию (в том числе из нескольких слов). */
+    size_t comma = n.find(',');
+    if (comma != std::string::npos && comma > 0 && n.find(',', comma + 1) == std::string::npos) {
+        std::string family = trim(n.substr(0, comma));
+        std::string given = trim(n.substr(comma + 1));
+        if (!family.empty() && !given.empty()) {
+            Author g = splitAuthor(given, false);
+            a.last = family;
+            if (g.middle.empty() && !g.last.empty() && !g.first.empty()) { a.first = g.first; a.middle = g.last; }
+            else if (g.first.empty()) a.first = g.last;
+            else { a.first = g.first; a.middle = trim(g.middle + " " + g.last); }
+            return a;
+        }
+    }
     std::vector<std::string> parts;
     size_t pos = 0;
     while (pos < n.size()) {

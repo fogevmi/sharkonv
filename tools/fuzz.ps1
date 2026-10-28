@@ -1,7 +1,7 @@
 # Robustness: feeds sharkonv.exe damaged copies of binary books (truncated, random bytes
 # overwritten) and checks that every run ends cleanly (exit 0 or 1) within a time limit.
 # A crash (access violation and the like) or a hang is a failure.
-param([int]$Count = 150, [string[]]$Files = @('word.doc', 'word-media.doc', 'word.pdf', 'word-media.pdf', 'handmade.pdf', 'word.docx', 'word.rtf', 'djvu-maugham.djvu', 'djvu-janas.djvu'))
+param([int]$Count = 150, [string[]]$Files = @('word.doc', 'word-media.doc', 'word.pdf', 'word-media.pdf', 'handmade.pdf', 'word.docx', 'word.rtf', 'djvu-maugham.djvu', 'djvu-janas.djvu', 'handmade.mobi', 'calibre-word.mobi'))
 $root = (Resolve-Path "$PSScriptRoot\..").Path
 $exe = "$root\build\sharkonv.exe"
 $work = Join-Path $env:TEMP 'sharkonv-fuzz'
