@@ -1,0 +1,11 @@
+Часть первая
+  Глава 1
+  Глава 2
+Эпилог
+title=Книга FB3
+author=Петров|Иван|
+series=Серия#3
+notes=1
+images=1
+has=strong,emphasis,poem,cite,table
+table=Key;Value|One;1

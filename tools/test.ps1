@@ -11,7 +11,7 @@ $work = Join-Path $env:TEMP "sharkonv-test"
 if (Test-Path $work) { Remove-Item $work -Recurse -Force }
 New-Item -ItemType Directory $work | Out-Null
 
-$formats = 'fb2', 'epub', 'html', 'txt', 'mobi'
+$formats = 'fb2', 'epub', 'html', 'txt', 'mobi', 'docx', 'rtf'
 $fail = 0; $pass = 0
 
 function Run([string]$in, [string]$fmt, [string]$outDir) {
@@ -43,6 +43,10 @@ foreach ($p in $produced | Where-Object { $_ -match '\.(epub|mobi)$' }) {
     foreach ($fmt in $formats) {
         Run $p $fmt (Join-Path $work ("2-" + [IO.Path]::GetFileName($p).Replace('.', '_'))) | Out-Null
     }
+}
+# DOCX and RTF we wrote -> FB2, for the structure check below
+foreach ($p in $produced | Where-Object { $_ -match '\.(docx|rtf)$' }) {
+    Run $p 'fb2' (Join-Path $work ("2-" + [IO.Path]::GetFileName($p).Replace('.', '_'))) | Out-Null
 }
 
 # 2b) every produced FB2 and every XML part of every EPUB must be well-formed XML
@@ -95,8 +99,8 @@ function Shape([string]$fb2, [bool]$series = $true) {
 foreach ($f in $inputs | Where-Object { $_.Extension -eq '.fb2' }) {
     $direct = Join-Path $work "1-$($f.BaseName)\$($f.BaseName).fb2"
     if (-not (Test-Path $direct)) { continue }
-    foreach ($via in 'epub', 'mobi') {
-        # MOBI has no series field, so series is only compared for EPUB
+    foreach ($via in 'epub', 'mobi', 'docx', 'rtf') {
+        # MOBI, DOCX and RTF have no series field, so series is only compared for EPUB
         $want = Shape $direct ($via -eq 'epub')
         $rt = Join-Path $work "2-$($f.BaseName)_$via\$($f.BaseName).fb2"
         $got = Shape $rt ($via -eq 'epub')
@@ -182,6 +186,29 @@ function Fb2Facts([string]$fb2) {
     }
 }
 
+# SHA-1 of the decoded pixels of the first picture, as WxH:hash, whatever way it was packed
+function FirstImagePixels([string]$fb2) {
+    $x = New-Object Xml.XmlDocument
+    $x.Load($fb2)
+    $ns = New-Object Xml.XmlNamespaceManager $x.NameTable
+    $ns.AddNamespace('f', 'http://www.gribuser.ru/xml/fictionbook/2.0')
+    $img = $x.SelectSingleNode('//f:body[not(@name)]//f:image', $ns)
+    if (-not $img) { return 'no image' }
+    $bin = $x.SelectSingleNode("//f:binary[@id='$($img.GetAttribute('href', 'http://www.w3.org/1999/xlink').TrimStart('#'))']", $ns)
+    if (-not $bin) { return 'no binary' }
+    Add-Type -AssemblyName System.Drawing
+    $src = New-Object Drawing.Bitmap (New-Object IO.MemoryStream (, [Convert]::FromBase64String($bin.InnerText)))
+    $rect = New-Object Drawing.Rectangle 0, 0, $src.Width, $src.Height
+    $d = $src.LockBits($rect, [Drawing.Imaging.ImageLockMode]::ReadOnly, [Drawing.Imaging.PixelFormat]::Format24bppRgb)
+    $buf = New-Object byte[] ($d.Stride * $d.Height)
+    [Runtime.InteropServices.Marshal]::Copy($d.Scan0, $buf, 0, $buf.Length)
+    $src.UnlockBits($d)
+    $hash = -join ([Security.Cryptography.SHA1]::Create().ComputeHash($buf) | ForEach-Object { $_.ToString('x2') })
+    $r = "$($src.Width)x$($src.Height):$hash"
+    $src.Dispose()
+    $r
+}
+
 # paragraph texts of the main text (titles excluded), whitespace collapsed
 function Fb2Paras([string]$fb2) {
     $x = New-Object Xml.XmlDocument
@@ -225,6 +252,8 @@ foreach ($exp in $expects) {
             'table'  { if ($facts.table -ne $v) { $problems += "table:`n    want: $v`n    got:  $($facts.table)" } }
             'table2' { if ($facts.table2 -ne $v) { $problems += "table2:`n    want: $v`n    got:  $($facts.table2)" } }
             'series' { if ($facts.series -ne $v) { $problems += "series: want '$v' got '$($facts.series)'" } }
+            # first image decoded: pixels pinned after checking them against Poppler / the source bitmap
+            'pixels' { $got = FirstImagePixels $fb2; if ($got -ne $v) { $problems += "pixels: want $v got $got" } }
             'notes'  { if ($facts.notes -ne [int]$v -or $facts.links -ne [int]$v) { $problems += "notes: want $v got $($facts.notes) notes / $($facts.links) note links" } }
             'has'    { foreach ($t in $v -split ',') { if (-not $facts.has[$t]) { $problems += "missing <$t>" } } }
             'paras'  {
@@ -319,6 +348,95 @@ if (Test-Path $nt) {
         $pass++; Write-Host "OK    DjVu without text layer -> refused with a reason"
     } else { $fail++; Write-Host "FAIL  DjVu without text layer: exit $LASTEXITCODE, $($log.Trim())" -ForegroundColor Red }
 }
+
+# 3d2) a PDF that needs a real password is refused with a reason, as Poppler refuses it
+$cp = Join-Path $corpus 'crypt-password.pdf'
+if (Test-Path $cp) {
+    $log = & $cli -f fb2 -o (Join-Path $work 'crypt-password') $cp | Out-String
+    if ($LASTEXITCODE -eq 1 -and $log -match (-join [char[]](0x043F, 0x0430, 0x0440, 0x043E, 0x043B))) {
+        $pass++; Write-Host "OK    PDF with a real password -> refused with a reason"
+    } else { $fail++; Write-Host "FAIL  PDF with a real password: exit $LASTEXITCODE, $($log.Trim())" -ForegroundColor Red }
+}
+
+# 3d2b) .pdb: PalmDOC is recognised by content (also as .prc); the other kinds of .pdb are refused
+#       with a reason: debug symbols of programs and other Palm book formats share the extension
+$pdbDir = Join-Path $work 'pdb'
+New-Item -ItemType Directory -Force $pdbDir | Out-Null
+Copy-Item (Join-Path $corpus 'handmade.pdb') (Join-Path $pdbDir 'palm.prc')
+$null = & $cli -f fb2 -o $pdbDir (Join-Path $pdbDir 'palm.prc') | Out-String
+$got = if (Test-Path (Join-Path $pdbDir 'palm.fb2')) { (Fb2Paras (Join-Path $pdbDir 'palm.fb2')) -join "`n" } else { '' }
+$want = (@([IO.File]::ReadAllLines((Join-Path $corpus 'handmade-pdb.paras'), [Text.Encoding]::UTF8) | Where-Object { $_ })) -join "`n"
+if ($got -eq $want) { $pass++; Write-Host "OK    PalmDOC named .prc -> read as PalmDOC" }
+else { $fail++; Write-Host "FAIL  PalmDOC named .prc: $got" -ForegroundColor Red }
+$sym = Join-Path $pdbDir 'symbols.pdb'
+[IO.File]::WriteAllBytes($sym, [Text.Encoding]::ASCII.GetBytes('Microsoft C/C++ MSF 7.00' + ('.' * 200)))
+$ztxt = [byte[]]::new(200)
+[Text.Encoding]::ASCII.GetBytes('zTXTGPlm').CopyTo($ztxt, 60)
+[IO.File]::WriteAllBytes((Join-Path $pdbDir 'ztxt.pdb'), $ztxt)
+foreach ($c in @(@('symbols.pdb', '\.pdb'), @('ztxt.pdb', 'zTXT'))) {
+    $log = & $cli -f fb2 -o $pdbDir (Join-Path $pdbDir $c[0]) | Out-String
+    if ($LASTEXITCODE -eq 1 -and ($log -split "`n")[0] -replace '^.*?\.pdb:', '' -match $c[1]) { $pass++; Write-Host "OK    $($c[0]) -> refused with a reason" }
+    else { $fail++; Write-Host "FAIL  $($c[0]): exit $LASTEXITCODE, $($log.Trim())" -ForegroundColor Red }
+}
+
+# 3d3) CHM: Windows help files are not ours to put into the repository, so this one only runs
+#      where the file exists. Page order and sections come from .hhc, page chrome must not leak.
+$chm = @(Get-ChildItem "$env:windir\Help\mui\*\cliconf.chm" -ErrorAction SilentlyContinue | Select-Object -First 1)
+if ($chm) {
+    $d = Join-Path $work 'chm-system'
+    $null = & $cli -f fb2 -o $d $chm[0].FullName | Out-String
+    $o = Join-Path $d 'cliconf.fb2'
+    $why = 'no output'
+    if (Test-Path $o) {
+        $x = New-Object Xml.XmlDocument; $x.Load($o)
+        $ns = New-Object Xml.XmlNamespaceManager $x.NameTable
+        $ns.AddNamespace('f', 'http://www.gribuser.ru/xml/fictionbook/2.0')
+        $n = $x.SelectNodes('//f:body[not(@name)]//f:section[f:title]', $ns).Count
+        $text = ($x.SelectNodes('//f:body[not(@name)]', $ns) | ForEach-Object { $_.InnerText }) -join ' '
+        $why = @()
+        if ($n -lt 20) { $why += "sections: $n" }
+        if ($text -match 'Visual Basic') { $why += 'page chrome left in the text' }
+        if ($x.SelectNodes('//f:body[not(@name)]//f:image', $ns).Count) { $why += 'chrome images left' }
+    }
+    if ($why) { $fail++; Write-Host "FAIL  CHM cliconf.chm: $($why -join ', ')" -ForegroundColor Red }
+    else { $pass++; Write-Host "OK    CHM cliconf.chm: $n sections, no page chrome" }
+} else { Write-Host "SKIP  CHM: no Windows help file on this system" }
+
+# 3d4) every DOCX and RTF written above: parts well-formed and linked, RTF braces balanced
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$docs = @(Get-ChildItem $work -Recurse -Include *.docx, *.rtf)
+$badDoc = @()
+foreach ($f in $docs) {
+    if ($f.Extension -eq '.rtf') {
+        $t = [Text.Encoding]::GetEncoding(1252).GetString([IO.File]::ReadAllBytes($f.FullName))
+        if (-not $t.StartsWith('{\rtf1')) { $badDoc += "$($f.Name): header"; continue }
+        $bal = 0; $esc = $false; $neg = $false
+        foreach ($ch in $t.ToCharArray()) {
+            if ($esc) { $esc = $false; continue }
+            if ($ch -eq '\') { $esc = $true } elseif ($ch -eq '{') { $bal++ } elseif ($ch -eq '}') { $bal--; if ($bal -lt 0) { $neg = $true } }
+        }
+        if ($bal -ne 0 -or $neg) { $badDoc += "$($f.Name): braces $bal" }
+        continue
+    }
+    $z = [IO.Compression.ZipFile]::OpenRead($f.FullName)
+    try {
+        $names = @($z.Entries | ForEach-Object { $_.FullName })
+        foreach ($need in '[Content_Types].xml', '_rels/.rels', 'word/document.xml', 'word/styles.xml') { if ($names -notcontains $need) { $badDoc += "$($f.Name): no $need" } }
+        foreach ($e in $z.Entries | Where-Object { $_.FullName -match '\.(xml|rels)$' }) {
+            $r = New-Object IO.StreamReader($e.Open(), [Text.Encoding]::UTF8)
+            $x = New-Object Xml.XmlDocument
+            try { $x.LoadXml($r.ReadToEnd()) } catch { $badDoc += "$($f.Name): $($e.FullName) is not XML" }
+            $r.Dispose()
+            if ($e.Name -match '\.rels$' -and $e.FullName -eq 'word/_rels/document.xml.rels') {
+                foreach ($rel in $x.DocumentElement.ChildNodes) {
+                    if ($rel.GetAttribute('TargetMode') -ne 'External' -and $names -notcontains ('word/' + $rel.GetAttribute('Target'))) { $badDoc += "$($f.Name): missing $($rel.GetAttribute('Target'))" }
+                }
+            }
+        }
+    } finally { $z.Dispose() }
+}
+if ($docs.Count -and -not $badDoc) { $pass++; Write-Host "OK    DOCX and RTF format: $($docs.Count) written files valid" }
+else { $fail++; Write-Host "FAIL  DOCX and RTF format ($($docs.Count) files): $(($badDoc | Select-Object -First 8) -join ' | ')" -ForegroundColor Red }
 
 # 3e) every MOBI written above must be valid by the format description itself (big-endian
 #     PalmDB, record 0, MOBI header, EXTH, FLIS/FCIS, EOF record), not just readable by our own

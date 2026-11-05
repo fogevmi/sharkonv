@@ -106,9 +106,9 @@ static Guess guessMetaFromName(const std::string& fileName) {
     for (int i = 0; i < 3; i++) {
         std::string e = pathExt(base);
         if (e == "fb2" || e == "txt" || e == "html" || e == "htm" || e == "docx" ||
-            e == "epub" || e == "mobi" || e == "azw" || e == "azw3" || e == "prc" ||
+            e == "epub" || e == "mobi" || e == "azw" || e == "azw3" || e == "prc" || e == "pdb" ||
             e == "zip" || e == "fbz" || e == "pdf" || e == "doc" || e == "dot" || e == "odt" ||
-            e == "rtf" || e == "djvu" || e == "djv")
+            e == "rtf" || e == "djvu" || e == "djv" || e == "fb3" || e == "chm")
             base = pathStripExt(base);
         else
             break;

@@ -6,6 +6,8 @@
    (Outlines), а без них — по размеру шрифта; сноски — надстрочный номер в тексте + мелкий
    текст с тем же номером внизу страницы. Сканы без текстового слоя не распознаются (это OCR). */
 #include "convert.h"
+#include "pdfcrypt.h"
+#include "imgcodec.h"
 #include <zlib.h>
 #include <math.h>
 
@@ -363,13 +365,16 @@ struct XEntry {
 
 class PdfDoc {
 public:
-    explicit PdfDoc(const std::string& data) : encrypted(false), s(data) {}
+    explicit PdfDoc(const std::string& data) : cryptStatus(CRYPT_NONE), s(data), cryptOn(false), cStm(0), cStr(0), keyLen(5), encryptMeta(true) {}
     bool open();
     const PObj& resolve(const PObj& o, int depth = 0);
     const PObj& object(int num);
     bool streamBytes(const PObj& stm, std::string& out);
     const PObj& trailer() const { return trail; }
-    bool encrypted;
+    /* 1.9: PDF с пустым паролем (его ставят, чтобы запретить печать или копирование, и открывается
+       он без запроса пароля) раньше отвергался как зашифрованный. Теперь расшифровывается. */
+    enum { CRYPT_NONE, CRYPT_OK, CRYPT_PASSWORD, CRYPT_UNKNOWN };
+    int cryptStatus;
 
 private:
     const std::string& s;
@@ -378,7 +383,15 @@ private:
     std::map<int, std::string> objStmData;
     std::set<int> loading;
     PObj trail;
+    bool cryptOn;
+    int cStm, cStr;          /* метод для потоков и строк: 0 — нет, 1 — RC4, 2 — AES-128, 3 — AES-256 */
+    size_t keyLen;
+    bool encryptMeta;
+    std::string fileKey;
 
+    void setupCrypt();
+    std::string decrypt(const std::string& data, int num, int gen, int method) const;
+    void decryptStrings(PObj& o, int num, int gen, int depth) const;
     bool readXref(size_t off, int depth);
     bool readXrefStream(const PObj& o, size_t objPos);
     void scanObjects();
@@ -393,6 +406,8 @@ bool PdfDoc::parseIndirect(size_t off, PObj& out) {
     if (!lx.parse(b, 0, false) || b.t != P_NUM) return false;
     if (!lx.parse(kw, 0, false) || kw.t != P_OP || kw.str != "obj") return false;
     if (!lx.parse(out, 0, true)) return false;
+    if (cryptOn) decryptStrings(out, a.intVal(), b.intVal(), 0);
+    if (out.t == P_DICT) { out.ref = a.intVal(); out.gen = b.intVal(); } /* номер нужен для ключа потока */
     size_t save = lx.p;
     lx.skipWs();
     if (out.t == P_DICT && s.compare(lx.p, 6, "stream") == 0) {
@@ -428,6 +443,137 @@ bool PdfDoc::parseIndirect(size_t off, PObj& out) {
         lx.p = save;
     }
     return true;
+}
+
+/* ключ файла при пустом пароле: алгоритмы 2 и 2.A–2.B из ISO 32000-1/-2 */
+static const unsigned char kPad[33] =
+    "\x28\xBF\x4E\x5E\x4E\x75\x8A\x41\x64\x00\x4E\x56\xFF\xFA\x01\x08"
+    "\x2E\x2E\x00\xB6\xD0\x68\x3E\x80\x2F\x0C\xA9\xFE\x64\x53\x69\x7A";
+
+/* хэш R6 (алгоритм 2.B) для пустого пароля и пользовательского ключа */
+static std::string r6Hash(const std::string& salt) {
+    std::string k = sha256(salt), e;
+    for (int i = 0; i < 64 || (unsigned char)e[e.size() - 1] > i - 32; i++) {
+        std::string k1;
+        for (int r = 0; r < 64; r++) k1 += k;
+        e = aesCbcEncrypt(k.substr(0, 16), k.substr(16, 16), k1);
+        int mod = 0;
+        for (int b = 0; b < 16; b++) mod += (unsigned char)e[b];
+        mod %= 3;
+        k = mod == 0 ? sha256(e) : (mod == 1 ? sha384(e) : sha512(e));
+    }
+    return k.substr(0, 32);
+}
+
+void PdfDoc::setupCrypt() {
+    cryptOn = false;
+    cryptStatus = CRYPT_UNKNOWN;
+    PObj enc = resolve(*trail.get("Encrypt"));
+    if (enc.t != P_DICT) return;
+    const PObj* flt = enc.get("Filter");
+    const PObj* V = enc.get("V");
+    const PObj* R = enc.get("R");
+    const PObj* O = enc.get("O");
+    const PObj* U = enc.get("U");
+    const PObj* P = enc.get("P");
+    if (!flt || flt->str != "Standard" || !R || !U) return;
+    int v = V ? V->intVal() : 0, r = R->intVal();
+    if (v < 1 || v > 5 || v == 3 || r < 2 || r > 6) return;
+    const PObj* em = enc.get("EncryptMetadata");
+    encryptMeta = !(em && em->t == P_BOOL && em->num == 0);
+    if (v <= 2) {
+        cStm = cStr = 1;
+    } else {
+        const PObj& cf = enc.get("CF") ? resolve(*enc.get("CF")) : kNull;
+        struct Pick {
+            static int of(PdfDoc& d, const PObj& e, const PObj& c, const char* key) {
+                const PObj* nm = e.get(key);
+                if (!nm || nm->str == "Identity") return 0;
+                const PObj* f = c.get(nm->str.c_str());
+                if (!f) return -1;
+                const PObj* m = d.resolve(*f).get("CFM");
+                if (!m || m->str == "None") return 0;
+                return m->str == "V2" ? 1 : (m->str == "AESV2" ? 2 : (m->str == "AESV3" ? 3 : -1));
+            }
+        };
+        cStm = Pick::of(*this, enc, cf, "StmF");
+        cStr = Pick::of(*this, enc, cf, "StrF");
+        if (cStm < 0 || cStr < 0) return;
+    }
+    if (r >= 5) {
+        const PObj* UE = enc.get("UE");
+        if (!UE || U->str.size() < 48 || UE->str.size() < 32) return;
+        std::string vsalt = U->str.substr(32, 8), ksalt = U->str.substr(40, 8), want = U->str.substr(0, 32);
+        std::string got = r == 5 ? sha256(vsalt) : r6Hash(vsalt);
+        if (got != want) { cryptStatus = CRYPT_PASSWORD; return; }
+        std::string ik = r == 5 ? sha256(ksalt) : r6Hash(ksalt);
+        fileKey = aesCbcDecrypt(ik, std::string(16, '\0'), UE->str.substr(0, 32));
+        keyLen = 32;
+    } else {
+        if (!O || !P || O->str.size() < 32) return;
+        const PObj* L = enc.get("Length");
+        keyLen = r == 2 ? 5 : (v == 4 ? 16 : (L ? (size_t)L->intVal() / 8 : 5));
+        if (keyLen < 5 || keyLen > 16) keyLen = 16;
+        std::string m((const char*)kPad, 32);
+        m += O->str.substr(0, 32);
+        unsigned pv = (unsigned)(long long)P->num;
+        for (int i = 0; i < 4; i++) m += (char)((pv >> (8 * i)) & 0xFF);
+        const PObj* idA = trail.get("ID");
+        const PObj& idR = idA ? resolve(*idA) : kNull;
+        std::string id0 = idR.t == P_ARR && !idR.arr.empty() ? resolve(idR.arr[0]).str : std::string();
+        m += id0;
+        if (r >= 4 && !encryptMeta) m += "\xFF\xFF\xFF\xFF";
+        std::string k = md5(m);
+        if (r >= 3) for (int i = 0; i < 50; i++) k = md5(k.substr(0, keyLen));
+        k.resize(keyLen);
+        /* проверка: U от пустого пароля (алгоритмы 4 и 5) */
+        bool ok;
+        if (r == 2) {
+            ok = rc4(k, std::string((const char*)kPad, 32)) == U->str.substr(0, 32);
+        } else {
+            std::string x = rc4(k, md5(std::string((const char*)kPad, 32) + id0));
+            for (int i = 1; i <= 19; i++) {
+                std::string ki = k;
+                for (size_t j = 0; j < ki.size(); j++) ki[j] = (char)(ki[j] ^ i);
+                x = rc4(ki, x);
+            }
+            ok = x == U->str.substr(0, 16);
+        }
+        if (!ok) { cryptStatus = CRYPT_PASSWORD; return; }
+        fileKey = k;
+    }
+    /* всё, что было прочитано до ключа, читалось без расшифровки */
+    cache.clear();
+    objStmData.clear();
+    cryptOn = true;
+    cryptStatus = CRYPT_OK;
+}
+
+std::string PdfDoc::decrypt(const std::string& data, int num, int gen, int method) const {
+    if (method == 0) return data;
+    std::string key = fileKey;
+    if (method != 3) {
+        std::string m = fileKey;
+        m += (char)(num & 0xFF); m += (char)((num >> 8) & 0xFF); m += (char)((num >> 16) & 0xFF);
+        m += (char)(gen & 0xFF); m += (char)((gen >> 8) & 0xFF);
+        if (method == 2) m += "sAlT";
+        key = md5(m).substr(0, std::min<size_t>(keyLen + 5, 16));
+    }
+    if (method == 1) return rc4(key, data);
+    if (data.size() < 32) return std::string();
+    std::string out = aesCbcDecrypt(key, data.substr(0, 16), data.substr(16));
+    if (!out.empty()) {
+        unsigned pad = (unsigned char)out[out.size() - 1];
+        if (pad >= 1 && pad <= 16 && pad <= out.size()) out.resize(out.size() - pad);
+    }
+    return out;
+}
+
+void PdfDoc::decryptStrings(PObj& o, int num, int gen, int depth) const {
+    if (depth > 100) return;
+    if (o.t == P_STR) o.str = decrypt(o.str, num, gen, cStr);
+    else if (o.t == P_ARR) for (size_t i = 0; i < o.arr.size(); i++) decryptStrings(o.arr[i], num, gen, depth + 1);
+    else if (o.t == P_DICT) for (size_t i = 0; i < o.dict.size(); i++) decryptStrings(o.dict[i].second, num, gen, depth + 1);
 }
 
 bool PdfDoc::readXrefStream(const PObj& o, size_t objPos) {
@@ -544,6 +690,22 @@ void PdfDoc::scanObjects() {
         x.off = q;
         xref[num] = x; /* позднее определение побеждает, как при инкрементальном сохранении */
     }
+    /* 1.9: в битом зашифрованном файле ключ нужен раньше объектных потоков — ищем описание шифра */
+    if (trail.t != P_DICT || !trail.get("Encrypt")) {
+        for (std::map<int, XEntry>::iterator it = xref.begin(); it != xref.end(); ++it) {
+            PObj o;
+            if (!parseIndirect(it->second.off, o) || !o.hasStream) continue;
+            const PObj* type = o.get("Type");
+            if (type && type->str == "XRef" && o.get("Encrypt")) { trail = o; trail.hasStream = false; }
+        }
+        size_t tp = s.rfind("trailer");
+        if (tp != std::string::npos && (trail.t != P_DICT || !trail.get("Encrypt"))) {
+            Lexer lx(s, tp + 7, s.size());
+            PObj t;
+            if (lx.parse(t, 0, true) && t.t == P_DICT && t.get("Encrypt")) trail = t;
+        }
+    }
+    if (trail.t == P_DICT && trail.get("Encrypt")) setupCrypt();
     /* объекты внутри объектных потоков */
     std::map<int, XEntry> base = xref;
     for (std::map<int, XEntry>::iterator it = base.begin(); it != base.end(); ++it) {
@@ -594,12 +756,19 @@ bool PdfDoc::open() {
         PObj off;
         if (lx.parse(off, 0, false) && off.t == P_NUM) ok = readXref((size_t)off.num, 0);
     }
+    if (ok && trail.t == P_DICT && trail.get("Encrypt")) {
+        setupCrypt();
+        if (cryptStatus >= CRYPT_PASSWORD) return true;
+    }
     if (!ok || trail.t != P_DICT || !trail.get("Root") || !resolve(*trail.get("Root")).get("Pages")) {
         trail = PObj();
         cache.clear();
+        objStmData.clear();
+        cryptOn = false;
+        cryptStatus = CRYPT_NONE;
         scanObjects();
     }
-    encrypted = trail.get("Encrypt") != NULL;
+    if (cryptStatus >= CRYPT_PASSWORD) return true;
     return trail.t == P_DICT && trail.get("Root");
 }
 
@@ -657,6 +826,23 @@ bool PdfDoc::streamBytes(const PObj& stm, std::string& out) {
     std::vector<const PObj*> parms;
     const PObj* f = stm.get("Filter");
     const PObj* dp = stm.get("DecodeParms");
+    if (cryptOn && cStm && stm.streamData.empty()) {
+        const PObj* ty = stm.get("Type");
+        bool plain = ty && (ty->str == "XRef" || (ty->str == "Metadata" && !encryptMeta));
+        if (f) {
+            /* свой фильтр /Crypt с /Identity: этот поток не зашифрован */
+            const PObj& fr = resolve(*f);
+            bool crypt = fr.t == P_NAME && fr.str == "Crypt";
+            if (fr.t == P_ARR && !fr.arr.empty() && resolve(fr.arr[0]).str == "Crypt") crypt = true;
+            if (crypt) {
+                const PObj* pr = dp ? &resolve(*dp) : NULL;
+                if (pr && pr->t == P_ARR && !pr->arr.empty()) pr = &resolve(pr->arr[0]);
+                const PObj* nm = pr ? pr->get("Name") : NULL;
+                if (!nm || nm->str == "Identity") plain = true;
+            }
+        }
+        if (!plain) data = decrypt(data, stm.ref, stm.gen, cStm);
+    }
     if (f) {
         const PObj& fr = resolve(*f);
         if (fr.t == P_NAME) { filters.push_back(fr.str); parms.push_back(dp ? &resolve(*dp) : NULL); }
@@ -684,6 +870,8 @@ bool PdfDoc::streamBytes(const PObj& stm, std::string& out) {
             next = ascii85(data);
         } else if (n == "ASCIIHexDecode" || n == "AHx") {
             next = asciiHex(data);
+        } else if (n == "Crypt") {
+            next = data;
         } else {
             out = data; /* картинки (DCT, JPX, CCITT) — как есть */
             return n == "DCTDecode";
@@ -1543,6 +1731,56 @@ struct Samples {
     }
 };
 
+/* параметры последнего фильтра потока (DecodeParms — словарь или массив по числу фильтров) */
+const PObj& lastParms(PdfDoc& doc, const PObj& img) {
+    const PObj* dp = img.get("DecodeParms");
+    if (!dp) return kNull;
+    const PObj& dr = doc.resolve(*dp);
+    if (dr.t == P_ARR) return dr.arr.empty() ? kNull : doc.resolve(dr.arr.back());
+    return dr;
+}
+
+/* 1.9: CCITT и JBIG2 -> упакованные строки по 1 биту (0 — чёрный). Раньше такие картинки
+   пропускались, а в них лежит большинство чёрно-белых сканов. */
+bool decodeBilevel(PdfDoc& doc, const PObj& img, const std::string& filter, int w, int h, std::string& out) {
+    std::string raw;
+    doc.streamBytes(img, raw); /* false здесь значит «дальше сжатая картинка», данные уже в raw */
+    const PObj& parms = lastParms(doc, img);
+    if (filter == "JBIG2Decode") {
+        std::string globals;
+        const PObj* g = parms.get("JBIG2Globals");
+        if (g) {
+            const PObj& gs = doc.resolve(*g);
+            if (gs.hasStream) doc.streamBytes(gs, globals);
+        }
+        return jbig2Decode(raw, globals, w, h, out);
+    }
+    CcittParams p;
+    p.columns = 1728;
+    p.rows = h;
+    const PObj* v;
+    if ((v = parms.get("K"))) p.k = doc.resolve(*v).intVal();
+    if ((v = parms.get("Columns"))) p.columns = doc.resolve(*v).intVal();
+    if ((v = parms.get("Rows")) && doc.resolve(*v).intVal() > 0) p.rows = doc.resolve(*v).intVal();
+    if ((v = parms.get("BlackIs1"))) p.blackIs1 = doc.resolve(*v).num != 0;
+    if ((v = parms.get("EncodedByteAlign"))) p.byteAlign = doc.resolve(*v).num != 0;
+    if (!ccittDecode(raw, p, out)) return false;
+    /* ширина строк может отличаться от /Width: приводим строки к ширине картинки */
+    size_t srb = (size_t)(p.columns + 7) / 8, drb = (size_t)(w + 7) / 8;
+    if (srb != drb && srb) {
+        std::string fixed;
+        size_t rows = out.size() / srb;
+        fixed.reserve(rows * drb);
+        for (size_t y = 0; y < rows; y++) {
+            std::string row = out.substr(y * srb, srb);
+            row.resize(drb, (char)(p.blackIs1 ? 0 : 0xFF));
+            fixed += row;
+        }
+        out.swap(fixed);
+    }
+    return true;
+}
+
 bool readSamples(PdfDoc& doc, const PObj& img, Samples& s, int comps) {
     const PObj* W = img.get("Width");
     const PObj* H = img.get("Height");
@@ -1571,8 +1809,12 @@ std::string lastFilter(PdfDoc& doc, const PObj& img) {
 
 /* картинка PDF -> JPEG (как есть) или PNG (собранный здесь) */
 bool pdfImageFile(PdfDoc& doc, const PObj& img, std::string& mime, std::string& out) {
+    std::string lf = lastFilter(doc, img);
+    bool bilevel = lf == "CCITTFaxDecode" || lf == "CCF" || lf == "JBIG2Decode";
     const PObj* im = img.get("ImageMask");
-    if (im && doc.resolve(*im).num != 0) return false; /* трафарет-заливка, не картинка */
+    /* трафарет-заливка — не картинка, кроме сканов: там страница бывает записана как трафарет */
+    bool isMask = im && doc.resolve(*im).num != 0;
+    if (isMask && !bilevel) return false;
     const PObj* csRef = img.get("ColorSpace");
     ColorSpace cs = csRef ? readColorSpace(doc, *csRef, 0) : ColorSpace();
     std::string filter = lastFilter(doc, img);
@@ -1581,11 +1823,41 @@ bool pdfImageFile(PdfDoc& doc, const PObj& img, std::string& mime, std::string& 
         mime = "image/jpeg";
         return doc.streamBytes(img, out) && out.size() > 2 && (unsigned char)out[0] == 0xFF;
     }
-    if (filter == "JPXDecode" || filter == "CCITTFaxDecode" || filter == "CCF" || filter == "JBIG2Decode") return false;
-    if (!cs.ok) return false;
-
     Samples s;
-    if (!readSamples(doc, img, s, cs.comps)) return false;
+    if (filter == "JPXDecode") {
+        /* 1.9: JPEG 2000 — обычно цветной слой сканов; показать его как есть читалки не умеют */
+        std::string raw;
+        doc.streamBytes(img, raw);
+        JpxImage jp;
+        if (!jpxDecode(raw, jp)) return false;
+        if (!csRef || !cs.ok || (cs.comps != jp.comps && !cs.indexed)) {
+            /* у JPX цветовое пространство может быть только в самом файле */
+            cs = ColorSpace();
+            cs.ok = true;
+            cs.comps = jp.comps;
+            cs.cmyk = jp.colorSpace == JpxImage::CS_CMYK;
+        }
+        s.w = jp.w;
+        s.h = jp.h;
+        s.bpc = 8;
+        s.comps = jp.comps;
+        s.data.swap(jp.pixels);
+    } else if (bilevel) {
+        const PObj* W = img.get("Width");
+        const PObj* H = img.get("Height");
+        s.w = W ? doc.resolve(*W).intVal() : 0;
+        s.h = H ? doc.resolve(*H).intVal() : 0;
+        if (s.w <= 0 || s.h <= 0 || s.w > 100000 || s.h > 100000) return false;
+        if (!decodeBilevel(doc, img, filter, s.w, s.h, s.data)) return false;
+        if (isMask || !cs.ok) { cs = ColorSpace(); cs.ok = true; cs.comps = 1; }
+        s.bpc = 1;
+        s.comps = 1;
+        size_t need = s.rowBytes() * (size_t)s.h;
+        if (s.data.size() < need) s.data.resize(need, (char)0xFF); /* не хватило строк — белые */
+    } else {
+        if (!cs.ok) return false;
+        if (!readSamples(doc, img, s, cs.comps)) return false;
+    }
     int w = s.w, h = s.h;
     bool invert = false;
     const PObj* dec = img.get("Decode");
@@ -2933,11 +3205,15 @@ bool readPDF(const Bytes& data, const std::string& fileName, Book& book, std::st
     std::string s(data.begin(), data.end());
     PdfDoc doc(s);
     if (!doc.open()) {
-        if (err) *err = "Повреждённый PDF: не найден каталог документа";
+        if (err) *err = "PDF повреждён: не найдено его содержание";
         return false;
     }
-    if (doc.encrypted) {
-        if (err) *err = "PDF зашифрован (защита от копирования) — сначала снимите защиту";
+    if (doc.cryptStatus == PdfDoc::CRYPT_PASSWORD) {
+        if (err) *err = "PDF открывается только по паролю — откройте его и сохраните без пароля";
+        return false;
+    }
+    if (doc.cryptStatus == PdfDoc::CRYPT_UNKNOWN) {
+        if (err) *err = "PDF зашифрован неизвестным способом (возможно, это защита издательства)";
         return false;
     }
     book.fileName = fileName;

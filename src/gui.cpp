@@ -6,6 +6,8 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shlwapi.h>
+#include <algorithm>
 
 #define IDC_LIST      1001
 #define IDC_ADD       1002
@@ -21,7 +23,7 @@
 #define IDC_FMTDESC   1012
 #define IDC_OPEN      1013
 #define IDC_DROP      1014
-#define IDC_FMT0      1100 /* IDC_FMT0 + 0..5 — плашки форматов */
+#define IDC_FMT0      1100 /* IDC_FMT0 + 0..7 — плашки форматов */
 
 #define WM_APP_ITEM   (WM_APP + 1)
 #define WM_APP_DONE   (WM_APP + 2)
@@ -68,7 +70,7 @@ struct AppState {
     HWND list, drop;
     HWND head1, head2, hint, fmtDesc, status, progress;
     HWND btnAdd, btnAddDir, btnRemove, btnClear, btnConvert, btnOpen;
-    HWND chips[6];
+    HWND chips[8];
     HFONT font, fontBold, fontBig, fontDrop;
     HICON icon;
     HANDLE thread;
@@ -78,6 +80,8 @@ struct AppState {
     int runTotal;
     bool statusError;
     bool busy;
+    int sortCol;           /* колонка сортировки списка, -1 — порядок добавления */
+    bool sortAsc;
     std::vector<std::wstring> files;
     std::vector<std::wstring> outputs;
     std::vector<int> state;
@@ -85,20 +89,23 @@ struct AppState {
                  fmtDesc(NULL), status(NULL), progress(NULL), btnAdd(NULL), btnAddDir(NULL),
                  btnRemove(NULL), btnClear(NULL), btnConvert(NULL), btnOpen(NULL), font(NULL),
                  fontBold(NULL), fontBig(NULL), fontDrop(NULL), icon(NULL), thread(NULL),
-                 lastListW(0), format(0), doneCount(0), runTotal(0), statusError(false), busy(false) {
-        for (int i = 0; i < 6; i++) chips[i] = NULL;
+                 lastListW(0), format(0), doneCount(0), runTotal(0), statusError(false), busy(false),
+                 sortCol(-1), sortAsc(true) {
+        for (int i = 0; i < 8; i++) chips[i] = NULL;
     }
 };
 
 AppState g_app;
 
-const char* kFormats[] = {"auto", "fb2", "epub", "mobi", "html", "txt"};
-const wchar_t* kFormatNames[] = {L"Авто", L"FB2", L"EPUB", L"MOBI", L"HTML", L"TXT"};
+const char* kFormats[] = {"auto", "fb2", "epub", "mobi", "docx", "rtf", "html", "txt"};
+const wchar_t* kFormatNames[] = {L"Авто", L"FB2", L"EPUB", L"MOBI", L"DOCX", L"RTF", L"HTML", L"TXT"};
 const wchar_t* kFormatDesc[] = {
     L"FB2-книги станут EPUB, все остальные — FB2. Подходит в большинстве случаев.",
     L"FB2 — для FBReader, AlReader, CoolReader, PocketBook. Лучше всего хранит сноски и оформление.",
     L"EPUB — для большинства читалок, телефонов и планшетов (Apple Books, Google Play Книги).",
     L"MOBI — для старых Kindle.",
+    L"DOCX — для Word и LibreOffice: оглавление, сноски, таблицы и картинки можно править.",
+    L"RTF — для старых версий Word, WordPad и почти любых текстовых редакторов.",
     L"HTML — одна веб-страница, откроется в любом браузере.",
     L"TXT — только текст, без картинок и оформления.",
 };
@@ -167,7 +174,7 @@ void iniSetInt(const wchar_t* key, int v) {
 /* формат в ini хранится именем (fb2, epub …), чтобы порядок плашек можно было менять */
 int loadFormatIndex() {
     std::wstring v = iniGet(L"format");
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 8; i++)
         if (_wcsicmp(v.c_str(), utf8ToW(kFormats[i]).c_str()) == 0) return i;
     return 0;
 }
@@ -348,7 +355,7 @@ void refreshAll() {
     EnableWindow(g_app.btnRemove, idle);
     EnableWindow(g_app.btnClear, idle);
     EnableWindow(g_app.btnOpen, idle);
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         EnableWindow(g_app.chips[i], idle);
         InvalidateRect(g_app.chips[i], NULL, FALSE);
     }
@@ -364,7 +371,7 @@ void refreshAll() {
 }
 
 void selectFormat(int f) {
-    if (f < 0 || f > 5 || g_app.busy) return;
+    if (f < 0 || f > 7 || g_app.busy) return;
     if (f != g_app.format) {
         g_app.format = f;
         saveFormatIndex(f);
@@ -378,6 +385,8 @@ void selectFormat(int f) {
 }
 
 /* ------------------------------- список --------------------------------- */
+
+void showSortArrow();
 
 void addOne(const std::wstring& path) {
     for (size_t i = 0; i < g_app.files.size(); i++)
@@ -409,10 +418,85 @@ void addPaths(const std::vector<std::wstring>& paths) {
     int before = (int)g_app.files.size();
     for (size_t i = 0; i < list.size(); i++) addOne(list[i]);
     int added = (int)g_app.files.size() - before;
+    if (added > 0 && g_app.sortCol >= 0) {
+        /* новые книги встали в конец: список больше не отсортирован, стрелка убирается */
+        g_app.sortCol = -1;
+        showSortArrow();
+    }
     refreshAll();
     if (added > 0) setStatus(L"Добавлено: " + books(added) + L".", false);
     else if (!list.empty()) setStatus(L"Эти книги уже в списке.", false);
-    else setStatus(L"Здесь нет книг подходящих форматов (FB2, EPUB, MOBI, PDF, DjVu, DOC, DOCX, ODT, RTF, TXT, HTML).", true);
+    else setStatus(L"Здесь нет книг подходящих форматов (FB2, FB3, EPUB, MOBI, AZW3, PDB, PDF, DjVu, DOC, DOCX, ODT, RTF, CHM, TXT, HTML).", true);
+}
+
+/* 1.9: сортировка по щелчку на заголовке колонки (раньше список шёл только в порядке добавления).
+   Имена — «по-человечески»: «Том 2» раньше «Том 10». */
+std::wstring getCell(int i, int sub) {
+    wchar_t buf[1024];
+    buf[0] = 0;
+    LVITEMW it;
+    ZeroMemory(&it, sizeof(it));
+    it.iSubItem = sub;
+    it.pszText = buf;
+    it.cchTextMax = 1024;
+    SendMessageW(g_app.list, LVM_GETITEMTEXTW, (WPARAM)i, (LPARAM)&it);
+    return buf;
+}
+
+struct SortRow {
+    std::wstring file, output, name, fmt, result;
+    int state;
+};
+
+struct SortLess {
+    int col;
+    bool asc;
+    bool operator()(const SortRow& a, const SortRow& b) const {
+        const std::wstring& x = col == 0 ? a.name : (col == 1 ? a.fmt : a.result);
+        const std::wstring& y = col == 0 ? b.name : (col == 1 ? b.fmt : b.result);
+        int c = StrCmpLogicalW(x.c_str(), y.c_str());
+        return asc ? c < 0 : c > 0;
+    }
+};
+
+void showSortArrow() {
+    HWND hdr = (HWND)SendMessageW(g_app.list, LVM_GETHEADER, 0, 0);
+    for (int i = 0; i < 3; i++) {
+        HDITEMW h;
+        ZeroMemory(&h, sizeof(h));
+        h.mask = HDI_FORMAT;
+        SendMessageW(hdr, HDM_GETITEMW, (WPARAM)i, (LPARAM)&h);
+        h.fmt &= ~(HDF_SORTUP | HDF_SORTDOWN);
+        if (i == g_app.sortCol) h.fmt |= g_app.sortAsc ? HDF_SORTUP : HDF_SORTDOWN;
+        SendMessageW(hdr, HDM_SETITEMW, (WPARAM)i, (LPARAM)&h);
+    }
+}
+
+void sortList(int col) {
+    if (g_app.busy || col < 0 || col > 2) return;
+    g_app.sortAsc = !(g_app.sortCol == col && g_app.sortAsc);
+    g_app.sortCol = col;
+    std::vector<SortRow> rows(g_app.files.size());
+    for (size_t i = 0; i < rows.size(); i++) {
+        rows[i].file = g_app.files[i];
+        rows[i].output = g_app.outputs[i];
+        rows[i].state = g_app.state[i];
+        rows[i].name = getCell((int)i, 0);
+        rows[i].fmt = getCell((int)i, 1);
+        rows[i].result = getCell((int)i, 2);
+    }
+    SortLess less = {col, g_app.sortAsc};
+    std::stable_sort(rows.begin(), rows.end(), less);
+    for (size_t i = 0; i < rows.size(); i++) {
+        g_app.files[i] = rows[i].file;
+        g_app.outputs[i] = rows[i].output;
+        g_app.state[i] = rows[i].state;
+        setCell((int)i, 0, rows[i].name);
+        setCell((int)i, 1, rows[i].fmt);
+        setCell((int)i, 2, rows[i].result);
+    }
+    showSortArrow();
+    InvalidateRect(g_app.list, NULL, FALSE);
 }
 
 void removeSelected() {
@@ -535,10 +619,10 @@ void chooseFiles() {
     ZeroMemory(&ofn, sizeof(ofn));
     ofn.lStructSize = sizeof(ofn);
     ofn.hwndOwner = g_app.hwnd;
-    ofn.lpstrFilter = L"Книги\0*.fb2;*.epub;*.mobi;*.prc;*.azw;*.azw3;*.pdf;*.djvu;*.djv;*.docx;*.doc;*.odt;*.rtf;*.txt;*.html;*.htm;*.fb2.zip;*.fbz;*.zip\0"
+    ofn.lpstrFilter = L"Книги\0*.fb2;*.epub;*.mobi;*.prc;*.pdb;*.azw;*.azw3;*.fb3;*.chm;*.pdf;*.djvu;*.djv;*.docx;*.doc;*.odt;*.rtf;*.txt;*.html;*.htm;*.fb2.zip;*.fbz;*.zip\0"
                       L"FB2 (*.fb2)\0*.fb2;*.fb2.zip;*.fbz\0"
                       L"EPUB (*.epub)\0*.epub\0"
-                      L"MOBI (*.mobi;*.prc;*.azw)\0*.mobi;*.prc;*.azw;*.azw3\0"
+                      L"MOBI, PalmDOC (*.mobi;*.prc;*.azw;*.pdb)\0*.mobi;*.prc;*.azw;*.azw3;*.pdb\0"
                       L"PDF, DjVu (*.pdf;*.djvu)\0*.pdf;*.djvu;*.djv\0"
                       L"Документы (*.docx;*.doc;*.odt;*.rtf)\0*.docx;*.doc;*.odt;*.rtf\0"
                       L"Тексты (*.txt)\0*.txt\0"
@@ -731,7 +815,7 @@ LRESULT CALLBACK dropProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             y += lineSmall + S(6);
             t.top = y; t.bottom = y + lineSmall;
             SetTextColor(dc, kMuted);
-            DrawTextW(dc, L"FB2 · EPUB · MOBI · PDF · DjVu · DOC(X) · ODT · RTF · TXT · HTML", -1, &t,
+            DrawTextW(dc, L"FB2 · FB3 · EPUB · MOBI · AZW3 · PDB · PDF · DjVu · DOC(X) · ODT · RTF · CHM · TXT · HTML", -1, &t,
                       DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
             SelectObject(dc, of);
             EndPaint(hwnd, &ps);
@@ -807,9 +891,9 @@ void layoutControls(HWND hwnd) {
     /* шаг 2: формат */
     MoveWindow(g_app.head2, pad, head2Y, inner, S(20), TRUE);
     int gap = S(8);
-    int chipW = (inner - gap * 5) / 6;
+    int chipW = (inner - gap * 7) / 8;
     if (chipW > S(100)) chipW = S(100);
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 8; i++)
         MoveWindow(g_app.chips[i], pad + i * (chipW + gap), chipY, chipW, chipH, TRUE);
     MoveWindow(g_app.fmtDesc, pad, descY, inner, descH, TRUE);
 
@@ -869,8 +953,9 @@ void createControls(HWND hwnd) {
     g_app.btnAddDir = makeChild(L"BUTTON", L"Добавить папку…", WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON, IDC_ADDDIR);
 
     g_app.drop = makeChild(L"FB2DropZone", NULL, WS_VISIBLE, IDC_DROP);
+    /* 1.9: LVS_NOSORTHEADER убран: с ним заголовки не нажимаются и сортировка щелчком никогда не вызывалась */
     g_app.list = makeChild(WC_LISTVIEWW, NULL,
-                           WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+                           WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                            IDC_LIST, WS_EX_CLIENTEDGE);
     SendMessageW(g_app.list, LVM_SETEXTENDEDLISTVIEWSTYLE, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER,
                  LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -890,7 +975,7 @@ void createControls(HWND hwnd) {
     g_app.btnClear = makeChild(L"BUTTON", L"Очистить", WS_TABSTOP | BS_PUSHBUTTON, IDC_CLEAR);
 
     g_app.head2 = makeChild(L"STATIC", L"2.  Во что конвертировать", WS_VISIBLE | SS_LEFT, IDC_HEAD2);
-    for (int i = 0; i < 6; i++)
+    for (int i = 0; i < 8; i++)
         g_app.chips[i] = makeChild(L"BUTTON", kFormatNames[i], WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, IDC_FMT0 + i);
     g_app.fmtDesc = makeChild(L"STATIC", L"", WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, IDC_FMTDESC);
 
@@ -979,7 +1064,7 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             else if (id == IDC_CLEAR) clearAll();
             else if (id == IDC_CONVERT) startConvert();
             else if (id == IDC_OPEN) openResult();
-            else if (id >= IDC_FMT0 && id < IDC_FMT0 + 6) selectFormat(id - IDC_FMT0);
+            else if (id >= IDC_FMT0 && id < IDC_FMT0 + 8) selectFormat(id - IDC_FMT0);
             return 0;
         }
 
@@ -1022,6 +1107,10 @@ LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (nh->code == LVN_KEYDOWN) {
                 NMLVKEYDOWN* k = (NMLVKEYDOWN*)lParam;
                 if (k->wVKey == VK_DELETE && !g_app.busy) removeSelected();
+                return 0;
+            }
+            if (nh->code == LVN_COLUMNCLICK) {
+                sortList(((NMLISTVIEW*)lParam)->iSubItem);
                 return 0;
             }
             if (nh->code == NM_DBLCLK) {

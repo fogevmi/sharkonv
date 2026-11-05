@@ -2,6 +2,7 @@
 #include "convert.h"
 #include "markup.h"
 #include "zip.h"
+#include "kf8.h"
 #include <functional>
 
 /* ============================== помощники =============================== */
@@ -167,9 +168,14 @@ static bool skipInlineTag(const std::string& t) {
            t == "meta" || t == "link";
 }
 
+static std::string inlineRange(const MNode* node, size_t from, size_t to, HtmlCtx& ctx);
 static std::string inlineHtmlOf(const MNode* node, HtmlCtx& ctx) {
+    return inlineRange(node, 0, node->kids.size(), ctx);
+}
+
+static std::string inlineRange(const MNode* node, size_t from, size_t to, HtmlCtx& ctx) {
     std::string s;
-    for (size_t i = 0; i < node->kids.size(); i++) {
+    for (size_t i = from; i < to && i < node->kids.size(); i++) {
         const MNode* ch = node->kids[i].get();
         if (ch->text) {
             std::string v = ch->value;
@@ -227,6 +233,30 @@ static bool hasBlockChildren(const MNode* el) {
             return true;
     }
     return false;
+}
+
+/* 1.9: текст прямо в контейнере рядом с блоками: <div><div>…</div>Текст <b>жирный</b></div>.
+   Обход контейнера смотрел только на элементы, и такой текст пропадал из книги молча — во всех
+   форматах на HTML (HTML, EPUB, MOBI, AZW3, CHM). Нашлось на подвале страниц CHM.
+   Возвращает конец группы подряд идущего текста и строчных тегов, начатой в i, или i, если в ней
+   нет ни одного непустого текстового узла: тогда элементы обрабатываются по отдельности, как раньше. */
+static bool inlineRunKid(const MNode* ch) {
+    if (ch->text) return true;
+    const std::string& t = ch->name;
+    return t == "a" || t == "b" || t == "strong" || t == "i" || t == "em" || t == "span" || t == "sub" || t == "sup" ||
+           t == "s" || t == "strike" || t == "del" || t == "u" || t == "small" || t == "big" || t == "font" ||
+           t == "code" || t == "tt" || t == "kbd" || t == "abbr" || t == "cite" || t == "dfn" || t == "q" || t == "nobr";
+}
+
+static size_t strayTextRun(const MNode* el, size_t i, HtmlCtx& ctx) {
+    bool text = false;
+    size_t j = i;
+    for (; j < el->kids.size(); j++) {
+        const MNode* ch = el->kids[j].get();
+        if (!inlineRunKid(ch) || (ctx.skip && ctx.skip->count(ch))) break;
+        if (ch->text && !collapse(ch->value).empty()) text = true;
+    }
+    return text ? j : i;
 }
 
 static std::string cleanTableHtml(const MNode* table, HtmlCtx& ctx) {
@@ -415,6 +445,13 @@ static void blockFromEl(const MNode* el, HtmlCtx& ctx, std::vector<Block>& out, 
         t == "footer" || t == "aside" || t == "td" || t == "th") {
         if (t == "li" || hasBlockChildren(el)) {
             for (size_t i = 0; i < el->kids.size(); i++) {
+                size_t runEnd = strayTextRun(el, i, ctx);
+                if (runEnd > i) {
+                    std::string h = trim(inlineRange(el, i, runEnd, ctx));
+                    if (hasVisibleText(h)) out.push_back(Block::p(h));
+                    i = runEnd - 1;
+                    continue;
+                }
                 const MNode* ch = el->kids[i].get();
                 if (ch->text) continue;
                 blockFromEl(ch, ctx, out, depth + 1);
@@ -476,6 +513,13 @@ static std::vector<Chapter> htmlToChapters(const MNode* root, HtmlCtx& ctx, bool
             if (depth > 60) return;
             depth++;
             for (size_t i = 0; i < node->kids.size(); i++) {
+                size_t runEnd = strayTextRun(node, i, ctx);
+                if (runEnd > i) {
+                    std::string h = trim(inlineRange(node, i, runEnd, ctx));
+                    if (hasVisibleText(h)) cur->blocks.push_back(Block::p(h));
+                    i = runEnd - 1;
+                    continue;
+                }
                 const MNode* ch = node->kids[i].get();
                 if (ch->text) continue;
                 if (ctx.skip && ctx.skip->count(ch)) continue;
@@ -616,8 +660,9 @@ static void collectNoteRefs(const MNode* n, NoteRefs& refs, int depth) {
 }
 
 static bool isNoteBoxTag(const std::string& t) {
+    /* 1.9: dl — так Calibre оформляет сноски в KF8: <dl id><dt>[←1]</dt><dd>текст</dd></dl> */
     return t == "p" || t == "li" || t == "div" || t == "aside" || t == "section" || t == "dd" ||
-           t == "blockquote" || t == "td";
+           t == "blockquote" || t == "td" || t == "dl";
 }
 
 /* в сноску не попадает то, что сноской быть не может: целая глава с заголовками */
@@ -1041,11 +1086,11 @@ static bool readFB2(const Bytes& data, const std::string& fileName, Book& book, 
         if (!doc.kids[i]->text) { root = doc.kids[i].get(); break; }
     }
     if (!root) {
-        if (err) *err = "Пустой файл FB2";
+        if (err) *err = "Файл FB2 пустой или повреждён";
         return false;
     }
     if (root->name != "fictionbook") {
-        if (err) *err = "Это не FB2: корневой элемент <" + root->name + ">";
+        if (err) *err = "Это не FB2: внутри другой тип документа (<" + root->name + ">)";
         return false;
     }
     book.fileName = fileName;
@@ -1810,7 +1855,7 @@ static bool readDOCX(const Bytes& data, const std::string& fileName, Book& book,
         low[lowerAscii(it->first)] = it->second;
 
     if (low.find("word/document.xml") == low.end()) {
-        if (err) *err = "В DOCX нет word/document.xml";
+        if (err) *err = "Это не документ Word: внутри архива нет текста документа";
         return false;
     }
     book.fileName = fileName;
@@ -2159,7 +2204,7 @@ static bool readODT(const Bytes& data, const std::string& fileName, Book& book, 
     for (std::map<std::string, Bytes>::iterator it = files.begin(); it != files.end(); ++it)
         low[lowerAscii(it->first)] = it->second;
     if (low.find("content.xml") == low.end()) {
-        if (err) *err = "В ODT нет content.xml";
+        if (err) *err = "Это не документ ODT: внутри архива нет текста документа";
         return false;
     }
     book.fileName = fileName;
@@ -2418,7 +2463,7 @@ static bool readEPUB(const Bytes& data, const std::string& fileName, Book& book,
             if (endsWithNoCase(it->first, ".opf")) { opfPath = it->first; break; }
     }
     if (opfPath.empty() || low.find(lowerAscii(opfPath)) == low.end()) {
-        if (err) *err = "В EPUB нет OPF-файла";
+        if (err) *err = "EPUB повреждён: нет описания книги (OPF-файла)";
         return false;
     }
     std::string opfDir = pathDirOf(opfPath);
@@ -2758,145 +2803,22 @@ static size_t mobiTrailingSize(const Bytes& rec, unsigned flags) {
    (src/calibre/ebooks/mobi/reader/index.py). */
 struct NcxEntry { size_t offset; std::string label; int depth; NcxEntry() : offset(0), depth(0) {} };
 
-/* число переменной длины: по 7 бит, старший бит отмечает последний байт */
-static size_t mobiDecint(const unsigned char* p, size_t n, unsigned& val) {
-    val = 0;
-    for (size_t i = 0; i < n && i < 5; i++) {
-        val = (val << 7) | (p[i] & 0x7F);
-        if (p[i] & 0x80) return i + 1;
-    }
-    return 0;
-}
-
-static unsigned beAt(const Bytes& r, size_t p, int n) {
-    if (p > r.size() || (size_t)n > r.size() - p) return 0;
-    unsigned v = 0;
-    for (int i = 0; i < n; i++) v = (v << 8) | r[p + i];
-    return v;
-}
-
 static void mobiReadNcx(const Bytes& b, const std::vector<unsigned>& offsets, unsigned indx,
                         std::vector<NcxEntry>& out) {
-    struct Rec {
-        static Bytes get(const Bytes& b, const std::vector<unsigned>& o, size_t i) {
-            if (i + 1 >= o.size() || o[i] >= o[i + 1] || o[i + 1] > b.size()) return Bytes();
-            return Bytes(b.begin() + o[i], b.begin() + o[i + 1]);
-        }
-    };
-    if (indx == 0 || indx + 1 >= offsets.size()) return;
-    Bytes prim = Rec::get(b, offsets, indx);
-    if (prim.size() < 56 || memcmp(&prim[0], "INDX", 4) != 0) return;
-    unsigned indexRecs = beAt(prim, 24, 4), ncncx = beAt(prim, 52, 4);
-    if (indexRecs > 1000 || ncncx > 1000) return;
-
-    /* TAGX: сразу за заголовком; на всякий случай ищем по сигнатуре */
-    size_t tx = beAt(prim, 4, 4);
-    if (tx + 12 > prim.size() || memcmp(&prim[tx], "TAGX", 4) != 0) {
-        tx = std::string::npos;
-        for (size_t i = 0; i + 12 <= prim.size(); i++)
-            if (memcmp(&prim[i], "TAGX", 4) == 0) { tx = i; break; }
-        if (tx == std::string::npos) return;
-    }
-    unsigned tagxLen = beAt(prim, tx + 4, 4), cbc = beAt(prim, tx + 8, 4);
-    if (tagxLen < 12 || tx + tagxLen > prim.size() || cbc == 0 || cbc > 8) return;
-    struct Tag { unsigned tag, perEntry, mask, eof; };
-    std::vector<Tag> tags;
-    for (size_t p = tx + 12; p + 4 <= tx + tagxLen; p += 4) {
-        Tag t = {prim[p], prim[p + 1], prim[p + 2], prim[p + 3]};
-        tags.push_back(t);
-    }
-
-    /* строки CNCX: длина (число переменной длины) + UTF-8; смещение = позиция + 0x10000 * номер записи */
+    std::vector<MobiIndexEntry> table;
     std::map<unsigned, std::string> cncx;
-    for (unsigned k = 0; k < ncncx; k++) {
-        Bytes c = Rec::get(b, offsets, indx + indexRecs + 1 + k);
-        size_t p = 0;
-        while (p < c.size()) {
-            unsigned len = 0;
-            size_t used = mobiDecint(&c[p], c.size() - p, len);
-            if (!used || len > c.size() - p - used) break;
-            if (len) cncx[(unsigned)p + 0x10000u * k] = std::string((const char*)&c[p + used], len);
-            p += used + len;
-        }
-    }
-
-    for (unsigned r = 1; r <= indexRecs; r++) {
-        Bytes d = Rec::get(b, offsets, indx + r);
-        if (d.size() < 28 || memcmp(&d[0], "INDX", 4) != 0) continue;
-        unsigned idxt = beAt(d, 20, 4), count = beAt(d, 24, 4);
-        if (idxt + 4 > d.size() || count > 65535 || (size_t)idxt + 4 + 2 * (size_t)count > d.size()) continue;
-        for (unsigned j = 0; j < count; j++) {
-            size_t s = beAt(d, idxt + 4 + 2 * j, 2);
-            size_t e = j + 1 < count ? beAt(d, idxt + 4 + 2 * (j + 1), 2) : idxt;
-            if (s >= e || e > d.size()) continue;
-            size_t p = s;
-            p += 1 + d[p];                                  /* имя записи: длина + байты */
-            if (p + cbc > e) continue;
-            std::vector<unsigned> cb(d.begin() + p, d.begin() + p + cbc);
-            p += cbc;
-            /* какие теги есть в записи и сколько у них значений */
-            struct PTag { unsigned tag, count, bytes, perEntry; };
-            std::vector<PTag> ptags;
-            size_t ci = 0;
-            for (size_t t = 0; t < tags.size(); t++) {
-                if (tags[t].eof) { ci++; continue; }
-                if (ci >= cb.size() || !tags[t].mask) continue;
-                unsigned value = cb[ci] & tags[t].mask;
-                if (!value) continue;
-                PTag pt = {tags[t].tag, 0, 0, tags[t].perEntry};
-                unsigned bits = 0;
-                for (unsigned m = tags[t].mask; m; m >>= 1) bits += m & 1;
-                if (value == tags[t].mask) {
-                    if (bits > 1) {
-                        unsigned v = 0;
-                        size_t used = mobiDecint(&d[p], e - p, v);
-                        if (!used) break;
-                        p += used;
-                        pt.bytes = v;
-                    } else {
-                        pt.count = 1;
-                    }
-                } else {
-                    unsigned m = tags[t].mask;
-                    while (!(m & 1)) { m >>= 1; value >>= 1; }
-                    pt.count = value;
-                }
-                ptags.push_back(pt);
-            }
-            std::map<unsigned, std::vector<unsigned> > tm;
-            bool broken = false;
-            for (size_t t = 0; t < ptags.size() && !broken; t++) {
-                std::vector<unsigned>& vals = tm[ptags[t].tag];
-                if (ptags[t].count) {
-                    for (unsigned k = 0; k < ptags[t].count * ptags[t].perEntry && k < 64; k++) {
-                        unsigned v = 0;
-                        size_t used = p < e ? mobiDecint(&d[p], e - p, v) : 0;
-                        if (!used) { broken = true; break; }
-                        p += used;
-                        vals.push_back(v);
-                    }
-                } else {
-                    size_t consumed = 0;
-                    while (consumed < ptags[t].bytes) {
-                        unsigned v = 0;
-                        size_t used = p < e ? mobiDecint(&d[p], e - p, v) : 0;
-                        if (!used) { broken = true; break; }
-                        p += used;
-                        consumed += used;
-                        vals.push_back(v);
-                    }
-                }
-            }
-            /* теги NCX: 1 — смещение в тексте, 3 — подпись в CNCX, 4 — глубина */
-            if (broken || tm[1].empty() || tm[3].empty()) continue;
-            std::map<unsigned, std::string>::iterator lab = cncx.find(tm[3][0]);
-            if (lab == cncx.end()) continue;
-            NcxEntry ne;
-            ne.offset = tm[1][0];
-            ne.label = collapse(lab->second);
-            ne.depth = tm[4].empty() ? 0 : (int)std::min(tm[4][0], 8u);
-            if (!ne.label.empty()) out.push_back(ne);
-        }
+    if (!mobiReadIndex(b, offsets, indx, table, cncx)) return;
+    for (size_t i = 0; i < table.size(); i++) {
+        /* теги NCX: 1 — смещение в тексте, 3 — подпись в CNCX, 4 — глубина */
+        std::map<unsigned, std::vector<unsigned> >& t = table[i].tags;
+        if (!t.count(1) || t[1].empty() || !t.count(3) || t[3].empty()) continue;
+        std::map<unsigned, std::string>::iterator lab = cncx.find(t[3][0]);
+        if (lab == cncx.end()) continue;
+        NcxEntry ne;
+        ne.offset = t[1][0];
+        ne.label = collapse(lab->second);
+        ne.depth = !t.count(4) || t[4].empty() ? 0 : (int)std::min(t[4][0], 8u);
+        if (!ne.label.empty()) out.push_back(ne);
     }
 }
 
@@ -3109,16 +3031,33 @@ static void extractLinkedNotes(Book& book) {
     }
 }
 
+/* 1.9: cp1251 или cp1252, когда файлу нельзя верить (MOBI, PalmDOC). В русском тексте верхних
+   байтов больше, чем латинских букв, в западном они редки. В разметке теги не считаются: их
+   латиница перевешивала кириллицу. */
+static UINT guessCyrOrWestern(const unsigned char* s, size_t n, bool markup) {
+    size_t high = 0, latin = 0;
+    bool inTag = false;
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = s[i];
+        if (markup && c == '<') inTag = true;
+        else if (markup && c == '>') inTag = false;
+        else if (inTag) continue;
+        else if (c >= 0xC0) high++;
+        else if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) latin++;
+    }
+    return high > latin ? 1251 : 1252;
+}
+
 static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, std::string* err) {
     if (b.size() < 100) {
-        if (err) *err = "Файл слишком мал для MOBI";
+        if (err) *err = "Файл слишком мал: книга обрезана или это не MOBI";
         return false;
     }
     /* PalmDB и MOBI — big-endian. 1.8: раньше читалось как little-endian, поэтому настоящие
        MOBI из Calibre и kindlegen не открывались («Повреждён первый блок MOBI») */
     unsigned numRecords = ((unsigned)b[76] << 8) | (unsigned)b[77];
     if (numRecords < 2) {
-        if (err) *err = "Повреждён заголовок PalmDB";
+        if (err) *err = "Файл повреждён или это не MOBI: не читается заголовок";
         return false;
     }
     std::vector<unsigned> offsets;
@@ -3130,13 +3069,13 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     }
     offsets.push_back((unsigned)b.size());
     if (offsets.size() < 3) {
-        if (err) *err = "Повреждён заголовок PalmDB";
+        if (err) *err = "Файл повреждён или это не MOBI: не читается заголовок";
         return false;
     }
 
     size_t r0start = offsets[0], r0end = offsets[1];
     if (r0start >= b.size() || r0end > b.size() || r0end <= r0start) {
-        if (err) *err = "Повреждён первый блок MOBI";
+        if (err) *err = "Файл повреждён или это не MOBI: не читается первый блок";
         return false;
     }
     Bytes r0(b.begin() + r0start, b.begin() + r0end);
@@ -3146,7 +3085,7 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     unsigned compression = R0U16(0);
     unsigned encryption = R0U16(12);
     if (encryption) {
-        if (err) *err = "Файл защищён DRM — конвертация невозможна";
+        if (err) *err = "Книга защищена DRM (куплена в магазине) — такие файлы не читаются";
         return false;
     }
     unsigned textRecords = R0U16(8);
@@ -3155,6 +3094,7 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     unsigned mobiVersion = 6;
     unsigned extraFlags = 0;   /* какие «хвосты» дописаны в конец каждой текстовой записи */
     unsigned ncxIndex = 0xFFFFFFFFu;
+    unsigned huffRecord = 0, huffCount = 0, fdstIndex = 0xFFFFFFFFu, fragIndex = 0xFFFFFFFFu, skelIndex = 0xFFFFFFFFu, guideIndex = 0xFFFFFFFFu;
 
     if (r0.size() >= 20 && r0[16] == 'M' && r0[17] == 'O' && r0[18] == 'B' && r0[19] == 'I') {
         unsigned headerLen = R0U32(16 + 4);
@@ -3167,25 +3107,31 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
         /* как в Calibre: флаги есть при длине заголовка от 0xE4, значимы младшие 16 бит */
         if (headerLen >= 0xE4) extraFlags = R0U16(16 + 0xE2);
         if (headerLen >= 0xE8) ncxIndex = R0U32(16 + 0xE4);   /* запись INDX оглавления */
-    }
-    if (mobiVersion >= 8) {
-        if (err) *err = "Это AZW3/KF8 — такие файлы здесь не читаются. Сконвертируйте их в FB2 через Calibre.";
-        return false;
+        huffRecord = R0U32(16 + 0x60);
+        huffCount = R0U32(16 + 0x64);
+        if (mobiVersion >= 8) {
+            fdstIndex = R0U32(16 + 0xB0);
+            fragIndex = R0U32(16 + 0xE8);
+            skelIndex = R0U32(16 + 0xEC);
+            guideIndex = R0U32(16 + 0xF4);
+        }
     }
 
     book.fileName = fileName;
 
-    std::string title;
+    std::string title, rawFullName;
     /* 1.8: проверки без сложения — в 32-битной сборке offset + length из битого файла
        переполнялись, проходили проверку и роняли программу (нашёл fuzz.ps1) */
     if (fullNameLength && fullNameOffset && fullNameOffset < r0.size() &&
         fullNameLength <= r0.size() - fullNameOffset) {
         std::string raw((const char*)&r0[fullNameOffset], fullNameLength);
+        rawFullName = raw;
         title = (encoding == 65001) ? raw : cpToUtf8(raw, 1252);
         while (!title.empty() && title[title.size() - 1] == '\0') title.erase(title.size() - 1);
     }
 
     long coverOffset = -1;
+    std::vector<std::string> exthAuthors;
     if (exthFlags & 0x40) {
         unsigned mobiLen = R0U32(16 + 4);
         size_t base = mobiLen < r0.size() ? 16 + (size_t)mobiLen : r0.size();
@@ -3200,8 +3146,7 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
                 std::string raw((const char*)&r0[p + 8], len - 8);
                 std::string val = raw;
                 if (type == 100 && !raw.empty()) {
-                    Author a = splitAuthor(val, false);
-                    if (!fullName(a).empty()) book.meta.authors.push_back(a);
+                    exthAuthors.push_back(val); /* 1.9: разбирается ниже, когда известна кодировка */
                 } else if (type == 503 && !val.empty() && title.empty()) {
                     title = val;
                 } else if (type == 524 && !val.empty()) {
@@ -3224,8 +3169,10 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     }
     book.meta.title = collapse(title);
 
-    if (compression == 17480) {
-        if (err) *err = "Сжатие HUFF/CDIC не поддерживается";
+    /* 1.9: HUFF/CDIC (kindlegen, книги из магазина без DRM): раньше такие книги отвергались */
+    HuffCdic huff;
+    if (compression == 17480 && !huff.load(b, offsets, huffRecord, huffCount)) {
+        if (err) *err = "Книга сжата методом HUFF/CDIC, но его таблицы повреждены";
         return false;
     }
     if (!textRecords || textRecords + 1 > offsets.size()) textRecords = (unsigned)offsets.size() - 2;
@@ -3243,14 +3190,53 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
         } else if (compression == 2) {
             Bytes dec = palmdocDecompress(rec);
             textBytes.insert(textBytes.end(), dec.begin(), dec.end());
+        } else if (compression == 17480) {
+            std::string dec;
+            if (rec.empty() || !huff.unpack(&rec[0], rec.size(), dec)) {
+                if (err) *err = "В MOBI не читается текст: файл повреждён";
+                return false;
+            }
+            textBytes.insert(textBytes.end(), dec.begin(), dec.end());
         } else {
-            if (err) *err = "Неизвестное сжатие MOBI: " + intToStr(compression);
+            if (err) *err = "Неизвестный метод сжатия MOBI (" + intToStr(compression) + ") — файл повреждён?";
             return false;
         }
     }
     if (textBytes.empty()) {
-        if (err) *err = "Не удалось прочитать текст MOBI";
+        if (err) *err = "В MOBI не читается текст: файл повреждён";
         return false;
+    }
+    /* 1.9: русские книги в cp1251 часто помечены как cp1252. Прежняя проверка сравнивала кириллицу
+       с «акцентами» по одним и тем же байтам и почти никогда не срабатывала: текст становился
+       кракозябрами. Название и автор из заголовка записаны в той же кодировке, что и текст;
+       автор раньше не перекодировался совсем. KF8 всегда в UTF-8. */
+    UINT textCp = (encoding == 65001 || mobiVersion >= 8) ? 0 : guessCyrOrWestern(&textBytes[0], textBytes.size(), true);
+    if (textCp == 1251 && !rawFullName.empty()) {
+        std::string t = cpToUtf8(rawFullName, 1251);
+        while (!t.empty() && t[t.size() - 1] == '\0') t.erase(t.size() - 1);
+        book.meta.title = collapse(t);
+    } else if (textCp && !isValidUtf8(book.meta.title)) {
+        book.meta.title = collapse(cpToUtf8(book.meta.title, textCp));
+    }
+    for (size_t i = 0; i < exthAuthors.size(); i++) {
+        Author a = splitAuthor(textCp && !isValidUtf8(exthAuthors[i]) ? cpToUtf8(exthAuthors[i], textCp) : exthAuthors[i], false);
+        if (!fullName(a).empty()) book.meta.authors.push_back(a);
+    }
+    /* 1.9: KF8 (AZW3): раньше такие книги отвергались. Текст — поток HTML, разрезанный на части */
+    if (mobiVersion >= 8) {
+        std::string flow((const char*)&textBytes[0], textBytes.size());
+        /* таблица потоков FDST: нужен первый поток, остальные — стили и SVG */
+        if (fdstIndex != 0xFFFFFFFFu && fdstIndex + 1 < offsets.size() && offsets[fdstIndex] + 16 <= b.size() &&
+            memcmp(&b[offsets[fdstIndex]], "FDST", 4) == 0) {
+            size_t f0 = offsets[fdstIndex];
+            size_t st = ((size_t)b[f0 + 4] << 24) | ((size_t)b[f0 + 5] << 16) | ((size_t)b[f0 + 6] << 8) | b[f0 + 7];
+            if (f0 + st + 8 <= b.size()) {
+                size_t e0 = ((size_t)b[f0 + st + 4] << 24) | ((size_t)b[f0 + st + 5] << 16) | ((size_t)b[f0 + st + 6] << 8) | b[f0 + st + 7];
+                if (e0 > 0 && e0 < flow.size()) flow.resize(e0);
+            }
+        }
+        if (!readKF8Body(b, offsets, flow, skelIndex, fragIndex, ncxIndex, guideIndex, firstImageIndex, coverOffset, fileName, book, err)) return false;
+        return true;
     }
     std::string rawText;
     {
@@ -3259,25 +3245,7 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
         if (ncxIndex != 0xFFFFFFFFu) mobiReadNcx(b, offsets, ncxIndex, ncx);
         mobiBlankHtmlToc(rawAll);
         mobiResolveFilepos(rawAll, ncx);
-        if (encoding == 65001) {
-            rawText = rawAll;
-        } else {
-            /* В MOBI обычно cp1252, но русские книги часто в cp1251.
-               Считаем кириллицу в варианте cp1251 и «акценты» в cp1252. */
-            std::string a = cpToUtf8(rawAll, 1251);
-            std::string b = cpToUtf8(rawAll, 1252);
-            size_t limit = std::min<size_t>(a.size() / 1, 200000);
-            int cyr = 0, acc = 0;
-            for (size_t i = 0, idx = 0; i < limit; idx++) {
-                unsigned cp = utf8CharAt(a, idx);
-                if (!cp) break;
-                i += (cp < 0x80) ? 1 : ((cp < 0x800) ? 2 : 3);
-                if (cp >= 0x400 && cp <= 0x4FF) cyr++;
-                unsigned cp2 = utf8CharAt(b, idx);
-                if (cp2 >= 0xC0 && cp2 <= 0xFF) acc++;
-            }
-            rawText = (cyr > 30 && cyr > acc * 2) ? a : b;
-        }
+        rawText = textCp ? cpToUtf8(rawAll, textCp) : rawAll;
     }
     for (size_t i = 0; i < rawText.size(); i++)
         if (rawText[i] == '\0') rawText.erase(i--, 1);
@@ -3386,12 +3354,93 @@ static bool readMOBI(const Bytes& b, const std::string& fileName, Book& book, st
     #undef R0U32
 }
 
+/* ============================== PalmDOC ================================ */
+
+/* 1.9: PalmDOC (.pdb, тип TEXt, создатель REAd) — старый формат книг для Palm. Попросили на
+   ru-board: раньше .pdb не брался совсем. Контейнер как у MOBI, но в тексте нет разметки, поэтому
+   он читается читателем TXT со всем разбиением на главы.
+   Запись 0: сжатие (+0), размер текста (+4), число текстовых записей (+8). Записи после текстовых —
+   закладки, в текст они не входят. */
+static bool readPalmDoc(const Bytes& b, const std::string& fileName, Book& book, std::string* err) {
+    unsigned numRecords = ((unsigned)b[76] << 8) | (unsigned)b[77];
+    std::vector<size_t> offsets;
+    for (unsigned i = 0; i < numRecords; i++) {
+        size_t p = 78 + (size_t)i * 8;
+        if (p + 4 > b.size()) break;
+        offsets.push_back(((size_t)b[p] << 24) | ((size_t)b[p + 1] << 16) | ((size_t)b[p + 2] << 8) | (size_t)b[p + 3]);
+    }
+    offsets.push_back(b.size());
+    if (offsets.size() < 3 || offsets[0] > b.size() || offsets[1] > b.size() || offsets[1] < offsets[0] + 10) {
+        if (err) *err = "Файл PalmDOC повреждён: не читается первый блок";
+        return false;
+    }
+    size_t r0 = offsets[0];
+    unsigned compression = ((unsigned)b[r0] << 8) | (unsigned)b[r0 + 1];
+    unsigned textRecords = ((unsigned)b[r0 + 8] << 8) | (unsigned)b[r0 + 9];
+    if (compression != 1 && compression != 2) {
+        if (err) *err = "Неизвестный метод сжатия PalmDOC (" + intToStr(compression) + ") — файл повреждён?";
+        return false;
+    }
+    /* неверное число записей в заголовке: считаем текстом всё, что есть */
+    if (!textRecords || textRecords > offsets.size() - 2) textRecords = (unsigned)offsets.size() - 2;
+
+    Bytes text;
+    for (unsigned i = 1; i <= textRecords; i++) {
+        size_t a = offsets[i], z = offsets[i + 1];
+        if (a > b.size() || z > b.size() || z < a) break;
+        Bytes rec(b.begin() + a, b.begin() + z);
+        if (compression == 2) rec = palmdocDecompress(rec);
+        text.insert(text.end(), rec.begin(), rec.end());
+    }
+    text.erase(std::remove(text.begin(), text.end(), (unsigned char)0), text.end());
+    if (text.empty()) {
+        if (err) *err = "В файле PalmDOC не читается текст: файл повреждён";
+        return false;
+    }
+
+    /* Кодировка нигде не записана. Calibre по умолчанию пишет cp1252, русские книги — в cp1251. */
+    std::string raw((const char*)&text[0], text.size());
+    UINT cp = 0;
+    if (!isValidUtf8(raw)) {
+        cp = guessCyrOrWestern(&text[0], text.size(), false);
+        raw = cpToUtf8(raw, cp);
+    }
+    if (!readTXT(Bytes(raw.begin(), raw.end()), fileName, book, err)) return false;
+
+    /* Название — имя базы в заголовке. Если оно обрезано (31 байт) или в нём «_» (так Calibre
+       заменяет всё, кроме латиницы и цифр), то лучше взять имя файла: это сделает normalizeBook */
+    std::string name((const char*)&b[0], 32);
+    size_t zero = name.find('\0');
+    if (zero != std::string::npos) name.resize(zero);
+    if (!name.empty() && name.size() < 31 && name.find('_') == std::string::npos)
+        book.meta.title = collapse(cp ? cpToUtf8(name, cp) : (isValidUtf8(name) ? name : cpToUtf8(name, 1251)));
+    return true;
+}
+
+/* Что лежит в файле Palm: тип и создатель записаны в заголовке со смещения 60 */
+static bool palmTypeIs(const Bytes& b, const char* type) {
+    return b.size() > 78 && memcmp(&b[60], type, 8) == 0;
+}
+
+/* 1.9: у .pdb то же расширение, что у отладочных символов программ и других форматов Palm:
+   причина отказа должна быть понятной */
+static std::string pdbRefusal(const Bytes& b) {
+    if (b.size() > 15 && memcmp(&b[0], "Microsoft C/C++", 15) == 0)
+        return "Это не книга, а файл отладочных символов программы (.pdb)";
+    if (palmTypeIs(b, "zTXTGPlm")) return "Это книга zTXT: поддерживается только PalmDOC";
+    if (palmTypeIs(b, "PNRdPPrs")) return "Это книга eReader: поддерживается только PalmDOC";
+    if (palmTypeIs(b, "DataPlkr")) return "Это книга Plucker: поддерживается только PalmDOC";
+    return "Это не книга PalmDOC";
+}
+
 /* ============================== диспетчер ============================== */
 
 bool readRTF(const Bytes& data, const std::string& fileName, Book& book, std::string* err); /* rtf.cpp */
 bool readPDF(const Bytes& data, const std::string& fileName, Book& book, std::string* err); /* pdf.cpp */
 bool readDOC(const Bytes& data, const std::string& fileName, Book& book, std::string* err); /* doc.cpp */
 bool readDJVU(const Bytes& data, const std::string& fileName, Book& book, std::string* err); /* djvu.cpp */
+bool readFB3(const Bytes& data, const std::string& fileName, Book& book, std::string* err); /* readers_more.cpp */
+bool readCHM(const Bytes& data, const std::string& fileName, Book& book, std::string* err); /* readers_more.cpp */
 
 bool readBook(const std::string& fileName, const Bytes& data, Book& out, std::string* err) {
     out = Book();
@@ -3412,7 +3461,7 @@ bool readBook(const std::string& fileName, const Bytes& data, Book& out, std::st
                 return true;
             }
         }
-        if (err) *err = "В архиве нет FB2-файла";
+        if (err) *err = "В этом ZIP-архиве нет книги FB2";
         return false;
     }
 
@@ -3426,24 +3475,35 @@ bool readBook(const std::string& fileName, const Bytes& data, Book& out, std::st
     if (ext == "doc" || ext == "dot") return readDOC(data, fileName, out, err);
     if (ext == "djvu" || ext == "djv") return readDJVU(data, fileName, out, err);
     if (ext == "epub") return readEPUB(data, fileName, out, err);
-    if (ext == "mobi" || ext == "azw" || ext == "azw3" || ext == "prc")
+    /* 1.9: PalmDOC узнаётся по содержимому: такие книги встречаются и с расширением .prc */
+    if (ext == "mobi" || ext == "azw" || ext == "azw3" || ext == "prc" || ext == "pdb") {
+        if (palmTypeIs(data, "TEXtREAd")) return readPalmDoc(data, fileName, out, err);
+        if (ext == "pdb" && !palmTypeIs(data, "BOOKMOBI")) {
+            if (err) *err = pdbRefusal(data);
+            return false;
+        }
         return readMOBI(data, fileName, out, err);
+    }
+    if (ext == "fb3") return readFB3(data, fileName, out, err);
+    if (ext == "chm") return readCHM(data, fileName, out, err);
 
     /* последняя попытка: определить по содержимому */
     if (data.size() > 5 && memcmp(&data[0], "{\\rtf", 5) == 0) return readRTF(data, fileName, out, err);
     if (data.size() > 5 && memcmp(&data[0], "%PDF-", 5) == 0) return readPDF(data, fileName, out, err);
     if (data.size() > 12 && memcmp(&data[0], "AT&TFORM", 8) == 0) return readDJVU(data, fileName, out, err);
     if (data.size() > 8 && memcmp(&data[0], "\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1", 8) == 0) return readDOC(data, fileName, out, err);
+    if (data.size() > 4 && memcmp(&data[0], "ITSF", 4) == 0) return readCHM(data, fileName, out, err);
     if (data.size() > 4 && data[0] == 'P' && data[1] == 'K') {
         std::map<std::string, Bytes> files;
         std::string zerr;
         if (zipRead(data, files, &zerr)) {
+            if (files.find("fb3/body.xml") != files.end()) return readFB3(data, fileName, out, err);
             if (files.find("word/document.xml") != files.end()) return readDOCX(data, fileName, out, err);
             if (files.find("content.xml") != files.end() && files.find("META-INF/container.xml") == files.end())
                 return readODT(data, fileName, out, err);
             return readEPUB(data, fileName, out, err);
         }
     }
-    if (err) *err = "Формат не поддерживается";
+    if (err) *err = "Формат файла не распознан: это не книга или файл повреждён";
     return false;
 }

@@ -23,7 +23,7 @@ set SRC=src
 set OUT=build
 set CXXFLAGS=-m32 -D_WIN32_WINNT=0x0501 -DWINVER=0x0501 -DUNICODE -D_UNICODE -O2 -fno-exceptions -fno-rtti -Wall -Wextra -Wno-unused-parameter -Wno-unused-variable -Wno-unused-but-set-variable -Wno-sign-compare
 set LDFLAGS=-static -static-libgcc -static-libstdc++ -Wl,--gc-sections -s
-set SOURCES=%SRC%\util.cpp %SRC%\markup.cpp %SRC%\zip.cpp %SRC%\book.cpp %SRC%\convert.cpp %SRC%\readers.cpp %SRC%\rtf.cpp %SRC%\pdf.cpp %SRC%\doc.cpp %SRC%\djvu.cpp %SRC%\writers.cpp %SRC%\notrace.cpp %SRC%\gui.cpp %SRC%\main.cpp
+set SOURCES=%SRC%\util.cpp %SRC%\markup.cpp %SRC%\zip.cpp %SRC%\book.cpp %SRC%\convert.cpp %SRC%\readers.cpp %SRC%\rtf.cpp %SRC%\pdf.cpp %SRC%\pdfcrypt.cpp %SRC%\ccitt_jbig2.cpp %SRC%\jpx.cpp %SRC%\doc.cpp %SRC%\djvu.cpp %SRC%\readers_more.cpp %SRC%\kf8.cpp %SRC%\writers.cpp %SRC%\writers_office.cpp %SRC%\notrace.cpp %SRC%\gui.cpp %SRC%\main.cpp
 
 if not exist "%OUT%" mkdir "%OUT%"
 if exist "%OUT%\sharkonv-cli.exe" del "%OUT%\sharkonv-cli.exe"

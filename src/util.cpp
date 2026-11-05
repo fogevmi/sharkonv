@@ -581,7 +581,14 @@ bool readFileBytes(const std::wstring& path, Bytes& out, std::string* err) {
     HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
-        if (err) *err = "Не удалось открыть файл (код " + intToStr(GetLastError()) + ")";
+        if (err) {
+            /* 1.9: раньше только «код N» — пользователю он ни о чём не говорит */
+            DWORD e = GetLastError();
+            if (e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND) *err = "Файл не найден: его переместили или удалили";
+            else if (e == ERROR_ACCESS_DENIED) *err = "Нет прав на чтение этого файла";
+            else if (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION) *err = "Файл занят другой программой — закройте её и попробуйте ещё раз";
+            else *err = "Не удалось открыть файл (код Windows " + intToStr(e) + ")";
+        }
         return false;
     }
     LARGE_INTEGER sz;
@@ -617,8 +624,10 @@ bool writeFileBytes(const std::wstring& path, const Bytes& data, std::string* er
     if (h == INVALID_HANDLE_VALUE) {
         if (err) {
             DWORD e = GetLastError();
-            if (e == ERROR_ACCESS_DENIED) *err = "Нет прав на запись в папку";
-            else if (e == ERROR_PATH_NOT_FOUND) *err = "Папка не существует";
+            if (e == ERROR_ACCESS_DENIED) *err = "Нет прав на запись в эту папку — укажите другую";
+            else if (e == ERROR_PATH_NOT_FOUND) *err = "Папка для результата не существует";
+            else if (e == ERROR_SHARING_VIOLATION || e == ERROR_LOCK_VIOLATION) *err = "Файл результата открыт в другой программе — закройте её и попробуйте ещё раз";
+            else if (e == ERROR_DISK_FULL) *err = "На диске нет места";
             else *err = "Не удалось создать файл (код " + intToStr(e) + ")";
         }
         return false;

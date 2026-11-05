@@ -1240,6 +1240,57 @@ static Bytes mobiU32Bytes(unsigned v) {
 }
 static Bytes mobiStrBytes(const std::string& s) { return Bytes(s.begin(), s.end()); }
 
+/* Сжатие PalmDOC одной записи: повтор 3–10 байт из предыдущих 2047, «пробел + символ»,
+   символ как есть, 1–8 байт вне ASCII со счётчиком. Поиск повторов — по цепочкам хэша. */
+static Bytes palmdocCompress(const unsigned char* s, size_t n) {
+    Bytes o;
+    o.reserve(n);
+    const int HASH = 1 << 12;
+    std::vector<int> head(HASH, -1), prev(n, -1);
+    size_t filled = 0;
+    #define PD_HASH(p) ((((unsigned)s[p] << 8) ^ ((unsigned)s[(p) + 1] << 4) ^ s[(p) + 2]) & (HASH - 1))
+    for (size_t i = 0; i < n;) {
+        for (; filled < i && filled + 2 < n; filled++) {
+            unsigned h = PD_HASH(filled);
+            prev[filled] = head[h];
+            head[h] = (int)filled;
+        }
+        size_t bestLen = 0, bestDist = 0;
+        if (i + 2 < n) {
+            int tries = 64;
+            for (int c = head[PD_HASH(i)]; c >= 0 && i - (size_t)c <= 2047 && tries-- > 0; c = prev[c]) {
+                size_t l = 0;
+                while (l < 10 && i + l < n && s[(size_t)c + l] == s[i + l]) l++;
+                if (l > bestLen) { bestLen = l; bestDist = i - (size_t)c; }
+                if (l == 10) break;
+            }
+        }
+        if (bestLen >= 3) {
+            unsigned v = 0x8000u | ((unsigned)bestDist << 3) | (unsigned)(bestLen - 3);
+            o.push_back((unsigned char)(v >> 8));
+            o.push_back((unsigned char)(v & 0xFF));
+            i += bestLen;
+            continue;
+        }
+        unsigned char c = s[i];
+        if (c == 0x20 && i + 1 < n && s[i + 1] >= 0x40 && s[i + 1] <= 0x7F) {
+            o.push_back((unsigned char)(s[i + 1] ^ 0x80));
+            i += 2;
+        } else if (c == 0 || (c >= 0x09 && c <= 0x7F)) {
+            o.push_back(c);
+            i++;
+        } else {
+            size_t run = 0;
+            while (run < 8 && i + run < n && s[i + run] != 0 && !(s[i + run] >= 0x09 && s[i + run] <= 0x7F)) run++;
+            o.push_back((unsigned char)run);
+            o.insert(o.end(), s + i, s + i + run);
+            i += run;
+        }
+    }
+    #undef PD_HASH
+    return o;
+}
+
 static unsigned pdbDate() {
     /* секунды с 1904-01-01 по Гринвичу */
     FILETIME ft;
@@ -1329,10 +1380,21 @@ static bool writeMOBI(Book& book, Bytes& out, std::string* err) {
     Bytes textBytes(finalText.begin(), finalText.end());
     const size_t REC = 4096;
     std::vector<Bytes> textRecords;
-    for (size_t i = 0; i < textBytes.size(); i += REC)
-        textRecords.push_back(Bytes(textBytes.begin() + i,
-                                    textBytes.begin() + std::min(textBytes.size(), i + REC)));
-    if (textRecords.empty()) textRecords.push_back(Bytes());
+    for (size_t i = 0; i < textBytes.size(); i += REC) {
+        /* 1.9: текст сжимается PalmDOC — раньше писался как есть и MOBI выходил крупнее. За сжатой
+           записью — продолжение разрезанной буквы UTF-8 и его длина (флаг 1 в заголовке, как у
+           Calibre): без них читалка на границе записей показывала бы мусор вместо буквы. */
+        size_t end = std::min(textBytes.size(), i + REC);
+        Bytes rec = palmdocCompress(&textBytes[i], end - i);
+        unsigned char overlap = 0;
+        while (overlap < 3 && end + overlap < textBytes.size() && (textBytes[end + overlap] & 0xC0) == 0x80) {
+            rec.push_back(textBytes[end + overlap]);
+            overlap++;
+        }
+        rec.push_back(overlap);
+        textRecords.push_back(rec);
+    }
+    if (textRecords.empty()) textRecords.push_back(Bytes(1, 0));
 
     std::vector<Bytes> imageBytes;
     for (size_t i = 0; i < imageOrder.size(); i++) {
@@ -1366,7 +1428,7 @@ static bool writeMOBI(Book& book, Bytes& out, std::string* err) {
     Bytes r0(padded, 0);
 
     /* PalmDOC-заголовок */
-    mobiSet16(r0, 0, 1);                        /* без сжатия */
+    mobiSet16(r0, 0, 2);                        /* сжатие PalmDOC */
     mobiSet16(r0, 2, 0);
     mobiSet32(r0, 4, (unsigned)textBytes.size());
     mobiSet16(r0, 8, (unsigned)textRecords.size());
@@ -1413,7 +1475,7 @@ static bool writeMOBI(Book& book, Bytes& out, std::string* err) {
     mobiSet32(r0, M + 0xD0, 0xFFFFFFFF);
     mobiSet32(r0, M + 0xD8, 0xFFFFFFFF);
     mobiSet32(r0, M + 0xDC, 0xFFFFFFFF);
-    mobiSet32(r0, M + 0xE0, 0);                 /* хвостов у текстовых записей нет */
+    mobiSet32(r0, M + 0xE0, 1);                 /* хвост записи: перекрытие многобайтной буквы */
     mobiSet32(r0, M + 0xE4, 0xFFFFFFFF);        /* индекса (INDX) нет */
 
     /* EXTH */
@@ -1512,6 +1574,9 @@ static bool writeMOBI(Book& book, Bytes& out, std::string* err) {
 
 /* ============================== диспетчер ============================== */
 
+bool writeDOCX(Book& book, Bytes& out, std::string* err);
+bool writeRTF(Book& book, Bytes& out, std::string* err);
+
 bool writeBook(Book& book, const std::string& target, Bytes& out, std::string* err) {
     std::string t = lowerAscii(target);
     if (t == "fb2") return writeFB2(book, out, err);
@@ -1519,6 +1584,8 @@ bool writeBook(Book& book, const std::string& target, Bytes& out, std::string* e
     if (t == "html" || t == "htm") return writeHTML(book, out, err);
     if (t == "txt") return writeTXT(book, out, err);
     if (t == "mobi") return writeMOBI(book, out, err);
+    if (t == "docx") return writeDOCX(book, out, err);
+    if (t == "rtf") return writeRTF(book, out, err);
     if (err) *err = "Выходной формат не поддерживается: " + target;
     return false;
 }

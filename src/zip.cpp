@@ -27,7 +27,7 @@ bool rawInflate(const unsigned char* src, size_t srcLen, Bytes& out, std::string
     z_stream zs;
     memset(&zs, 0, sizeof(zs));
     if (inflateInit2(&zs, -15) != Z_OK) {
-        if (err) *err = "zlib: не удалось начать распаковку";
+        if (err) *err = "Не удалось начать распаковку";
         return false;
     }
     zs.next_in = (Bytef*)src;
@@ -45,7 +45,7 @@ bool rawInflate(const unsigned char* src, size_t srcLen, Bytes& out, std::string
     } while (rc != Z_STREAM_END);
     inflateEnd(&zs);
     if (rc != Z_STREAM_END && rc != Z_OK && rc != Z_BUF_ERROR) {
-        if (err) *err = "Не удалось распаковать данные (повреждённый архив?)";
+        if (err) *err = "Архив повреждён: данные не распаковываются";
         return false;
     }
     return true;
@@ -75,7 +75,7 @@ bool rawDeflate(const unsigned char* src, size_t srcLen, Bytes& out) {
 bool zipRead(const Bytes& b, std::map<std::string, Bytes>& out, std::string* err) {
     out.clear();
     if (b.size() < 22) {
-        if (err) *err = "Файл слишком мал для ZIP";
+        if (err) *err = "Файл слишком мал: архив обрезан или это не архив";
         return false;
     }
     size_t eocd = (size_t)-1;
@@ -85,7 +85,7 @@ bool zipRead(const Bytes& b, std::map<std::string, Bytes>& out, std::string* err
         if (i == 0) break;
     }
     if (eocd == (size_t)-1) {
-        if (err) *err = "Это не ZIP-архив (или он повреждён)";
+        if (err) *err = "Файл повреждён или это не ZIP-архив, хотя у него такое расширение";
         return false;
     }
     unsigned count = rd16(b, eocd + 10);

@@ -4,7 +4,7 @@
 
 int runGui(HINSTANCE hInst, const std::vector<std::wstring>& files);
 
-#define APP_VERSION L"1.8"
+#define APP_VERSION L"1.9"
 
 /* --------------------------- вывод в консоль ---------------------------- */
 
@@ -143,11 +143,11 @@ static void printHelp() {
     conLine(L"  sharkonv.exe -f auto -o D:\\Out D:\\In   авто: FB2 -> EPUB, остальное -> FB2");
     conLine(L"");
     conLine(L"Ключи:");
-    conLine(L"  -f, --format  auto | fb2 | epub | html | txt | mobi");
+    conLine(L"  -f, --format  auto | fb2 | epub | mobi | docx | rtf | html | txt");
     conLine(L"  -o, --out     папка для результатов (по умолчанию — рядом с исходником)");
     conLine(L"  -h, --help    эта справка      -v, --version  версия");
     conLine(L"");
-    conLine(L"Вход: FB2 (.fb2, .fb2.zip), EPUB, MOBI/PRC/AZW, PDF, DjVu, DOC, DOCX, ODT, RTF, TXT, HTML.");
+    conLine(L"Вход: FB2 (.fb2, .fb2.zip), FB3, EPUB, MOBI/PRC/AZW/AZW3, PDB (PalmDOC), PDF, DjVu, DOC, DOCX, ODT, RTF, CHM, TXT, HTML.");
     conLine(L"В консольном режиме существующий файл результата заменяется.");
     conLine(L"Код возврата: 0 — без ошибок, 1 — были ошибки, 2 — неверные параметры.");
     conLine(L"В .bat-файле программа дожидается конца сама; в окне cmd используйте");
